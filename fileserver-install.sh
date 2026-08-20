@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # fileserver — install / uninstall script
 # Usage:
-#   sudo ./fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
+#   sudo ./fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER] [--bind ADDR] [--token TOKEN]
 #   sudo ./fileserver-install.sh uninstall
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
@@ -14,6 +14,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 DEFAULT_PORT=8080
 DEFAULT_DIR="/srv/fileserver"
 DEFAULT_USER="www-data"
+DEFAULT_BIND="127.0.0.1"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 red()   { echo -e "\033[0;31m$*\033[0m"; }
@@ -30,13 +31,15 @@ require_root() {
 usage() {
     bold "fileserver install script"
     echo
-    echo "  sudo $0 install   [--port PORT] [--dir DIR] [--user USER]"
+    echo "  sudo $0 install   [--port PORT] [--dir DIR] [--user USER] [--bind ADDR] [--token TOKEN]"
     echo "  sudo $0 uninstall"
     echo
     echo "Defaults:"
     echo "  --port  $DEFAULT_PORT"
     echo "  --dir   $DEFAULT_DIR"
     echo "  --user  $DEFAULT_USER"
+    echo "  --bind  $DEFAULT_BIND   (use 0.0.0.0 to expose on the network)"
+    echo "  --token <random>        (auto-generated if omitted; enables auth)"
     exit 0
 }
 
@@ -47,12 +50,16 @@ CMD=$1; shift
 PORT=$DEFAULT_PORT
 SERVE_DIR=$DEFAULT_DIR
 RUN_USER=$DEFAULT_USER
+BIND=$DEFAULT_BIND
+TOKEN=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --port)  PORT=$2;      shift 2 ;;
         --dir)   SERVE_DIR=$2; shift 2 ;;
         --user)  RUN_USER=$2;  shift 2 ;;
+        --bind)  BIND=$2;      shift 2 ;;
+        --token) TOKEN=$2;     shift 2 ;;
         -h|--help) usage ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -98,6 +105,18 @@ do_install() {
     chown "$RUN_USER":"$RUN_USER" "$SERVE_DIR"
     chmod 755 "$SERVE_DIR"
 
+    # ── auth token ────────────────────────────────────────────────────────────
+    if [[ -z "$TOKEN" ]]; then
+        if command -v openssl &>/dev/null; then
+            TOKEN=$(openssl rand -hex 24)
+        else
+            TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        fi
+    fi
+    printf 'FS_TOKEN=%s\n' "$TOKEN" > "$INSTALL_DIR/.fs_token"
+    chown root:root "$INSTALL_DIR/.fs_token"
+    chmod 600 "$INSTALL_DIR/.fs_token"
+
     # ── write Python server ───────────────────────────────────────────────────
     cyan "Writing server..."
     cat > "$INSTALL_DIR/serve.py" << 'PYEOF'
@@ -105,19 +124,27 @@ do_install() {
 """fileserver — minimal HTTP file server with web UI, upload, and download tracking."""
 
 import argparse
+import base64
+import hmac
 import http.server
 import json
 import mimetypes
 import os
-import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 
 STATS_FILE = ".fs_stats.json"
 _stats_lock = threading.Lock()
+
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+AUTH_WINDOW = 60
+AUTH_MAX_FAILURES = 5
 
 
 # ── stats persistence ─────────────────────────────────────────────────────────
@@ -431,9 +458,55 @@ load();
 
 class Handler(http.server.BaseHTTPRequestHandler):
     serve_dir = "."
+    token = None
+    _auth_failures = {}
+    _auth_lock = threading.Lock()
 
     def log_message(self, fmt, *args):
         print(f"[{self.address_string()}] {fmt % args}", flush=True)
+
+    def _check_auth(self):
+        if not self.token:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            cred = base64.b64decode(auth[6:].strip()).decode("utf-8", errors="replace")
+        except Exception:
+            return False
+        if ":" not in cred:
+            return False
+        _, password = cred.split(":", 1)
+        return hmac.compare_digest(password, self.token)
+
+    def _auth_failures_for(self, ip):
+        now = time.time()
+        with self._auth_lock:
+            recent = [t for t in self._auth_failures.get(ip, []) if now - t < AUTH_WINDOW]
+            self._auth_failures[ip] = recent
+            return len(recent)
+
+    def _record_auth_failure(self, ip):
+        with self._auth_lock:
+            self._auth_failures.setdefault(ip, []).append(time.time())
+
+    def _require_auth(self):
+        ip = self.client_address[0]
+        if self._auth_failures_for(ip) >= AUTH_MAX_FAILURES:
+            self.send_json({"error": "Too many failed attempts. Try again later."}, 429)
+            return False
+        if self._check_auth():
+            return True
+        self._record_auth_failure(ip)
+        body = json.dumps({"error": "Unauthorized"}).encode()
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="fileserver"')
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
 
     def send_json(self, data, status=200):
         body = json.dumps(data).encode()
@@ -444,6 +517,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._require_auth():
+            return
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         if path == "/":
             self._serve_html()
@@ -457,6 +532,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        if not self._require_auth():
+            return
         if self.path == "/upload":
             self._upload()
         else:
@@ -500,6 +577,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         })
 
     def _download(self, filename):
+        filename = filename.replace("\r", "").replace("\n", "").replace('"', "")
+        if not filename or any(p.startswith(".") for p in filename.split("/")):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
         filepath = os.path.realpath(os.path.join(self.serve_dir, filename))
         root     = os.path.realpath(self.serve_dir)
         if not (filepath.startswith(root + os.sep) or filepath == root):
@@ -531,36 +612,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for part in ct.split(";"):
             part = part.strip()
             if part.startswith("boundary="):
-                boundary = part[9:].strip('"').encode()
+                boundary = part[9:].strip('"')
                 break
         if not boundary:
             self.send_json({"error": "No boundary"}, 400)
             return
-        length = int(self.headers.get("Content-Length", 0))
-        body   = self.rfile.read(length)
-        saved  = []
-        for part in body.split(b"--" + boundary)[1:]:
-            if part.startswith(b"--"):
-                break
-            if b"\r\n\r\n" not in part:
-                continue
-            hdr_raw, data = part.split(b"\r\n\r\n", 1)
-            data = data.rstrip(b"\r\n")
-            filename = None
-            for line in hdr_raw.decode("utf-8", errors="replace").split("\r\n"):
-                if "Content-Disposition" in line and "filename=" in line:
-                    for tok in line.split(";"):
-                        tok = tok.strip()
-                        if tok.startswith("filename="):
-                            filename = tok[9:].strip('"')
-            if not filename or not data:
-                continue
-            filename = os.path.basename(filename)
-            if not filename:
-                continue
-            with open(os.path.join(self.serve_dir, filename), "wb") as f:
-                f.write(data)
-            saved.append(filename)
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_json({"error": "Invalid Content-Length"}, 400)
+            return
+        if length <= 0:
+            self.send_json({"error": "Empty request body"}, 400)
+            return
+        if length > MAX_UPLOAD_BYTES:
+            self.send_json({"error": f"Upload too large (max {MAX_UPLOAD_BYTES} bytes)"}, 413)
+            return
+        try:
+            body = self.rfile.read(length)
+        except Exception:
+            self.send_json({"error": "Failed to read request body"}, 400)
+            return
+        if len(body) > MAX_UPLOAD_BYTES:
+            self.send_json({"error": "Upload too large"}, 413)
+            return
+
+        saved = []
+        try:
+            msg = BytesParser(policy=policy.default).parsebytes(
+                b"Content-Type: multipart/form-data; boundary=" + boundary.encode() + b"\r\n\r\n" + body
+            )
+            for part in msg.iter_parts():
+                filename = part.get_filename()
+                data = part.get_payload(decode=True)
+                if not filename or not data:
+                    continue
+                filename = os.path.basename(filename)
+                if not filename or filename.startswith("."):
+                    continue
+                target = os.path.join(self.serve_dir, filename)
+                fd, tmp = tempfile.mkstemp(dir=self.serve_dir, prefix=".upload-", suffix=".tmp")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, target)
+                saved.append(filename)
+        except Exception as e:
+            self.send_json({"error": f"Upload failed: {e}"}, 400)
+            return
         if saved:
             self.send_json({"saved": saved})
         else:
@@ -571,9 +669,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="fileserver")
-    parser.add_argument("--port", "-p", type=int,  default=8080)
-    parser.add_argument("--dir",  "-d",            default=".")
-    parser.add_argument("--bind", "-b",            default="0.0.0.0")
+    parser.add_argument("--port",  "-p", type=int, default=8080)
+    parser.add_argument("--dir",   "-d",           default=".")
+    parser.add_argument("--bind",  "-b",           default="127.0.0.1")
+    parser.add_argument("--token", "-t",           default=os.environ.get("FS_TOKEN", ""))
     args = parser.parse_args()
 
     serve_dir = os.path.abspath(args.dir)
@@ -582,10 +681,12 @@ def main():
         sys.exit(1)
 
     Handler.serve_dir = serve_dir
+    Handler.token = args.token or None
     server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
 
     print(f"Serving : {serve_dir}")
-    print(f"Endpoint: http://0.0.0.0:{args.port}/")
+    print(f"Endpoint: http://{args.bind}:{args.port}/")
+    print("Auth    : " + ("enabled (HTTP Basic)" if Handler.token else "DISABLED — no token set"))
 
     try:
         server.serve_forever()
@@ -610,7 +711,8 @@ After=network.target
 Type=simple
 User=${RUN_USER}
 Group=${RUN_USER}
-ExecStart=/usr/bin/python3 ${INSTALL_DIR}/serve.py --port ${PORT} --dir ${SERVE_DIR}
+EnvironmentFile=-${INSTALL_DIR}/.fs_token
+ExecStart=/usr/bin/python3 ${INSTALL_DIR}/serve.py --port ${PORT} --dir ${SERVE_DIR} --bind ${BIND}
 Restart=on-failure
 RestartSec=5
 # Harden a bit
@@ -634,9 +736,13 @@ EOF
     echo
     bold "  Serve directory : $SERVE_DIR"
     bold "  Port            : $PORT"
+    bold "  Bind            : $BIND"
     bold "  Service user    : $RUN_USER"
     bold "  Python script   : $INSTALL_DIR/serve.py"
     bold "  Service file    : $SERVICE_FILE"
+    echo
+    cyan "  Auth token      : $TOKEN"
+    cyan "  Authenticate with: curl -u :$TOKEN http://<host>:${PORT}/"
     echo
     cyan "  Open: http://$(hostname -I | awk '{print $1}'):${PORT}/"
     echo

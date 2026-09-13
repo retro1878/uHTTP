@@ -2,7 +2,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # fileserver — install / uninstall script
 # Usage:
-#   sudo ./fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER] [--bind ADDR] [--token TOKEN]
+#   sudo ./fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
+#                                       [--bind ADDR] [--token TOKEN]
+#                                       [--allow-host HOST]... [--max-upload MiB]
 #   sudo ./fileserver-install.sh uninstall
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
@@ -15,6 +17,7 @@ DEFAULT_PORT=8080
 DEFAULT_DIR="/srv/fileserver"
 DEFAULT_USER="www-data"
 DEFAULT_BIND="127.0.0.1"
+DEFAULT_MAX_UPLOAD=512   # MiB
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 red()   { echo -e "\033[0;31m$*\033[0m"; }
@@ -25,21 +28,30 @@ bold()  { echo -e "\033[1m$*\033[0m"; }
 die()   { red "ERROR: $*"; exit 1; }
 
 require_root() {
-    [[ $EUID -eq 0 ]] || die "Run as root: sudo $0 $*"
+    [[ $EUID -eq 0 ]] || die "Run as root: sudo $0"
 }
 
 usage() {
     bold "fileserver install script"
     echo
-    echo "  sudo $0 install   [--port PORT] [--dir DIR] [--user USER] [--bind ADDR] [--token TOKEN]"
+    echo "  sudo $0 install   [--port PORT] [--dir DIR] [--user USER]"
+    echo "                    [--bind ADDR] [--token TOKEN]"
+    echo "                    [--allow-host HOST]... [--max-upload MiB]"
     echo "  sudo $0 uninstall"
     echo
     echo "Defaults:"
-    echo "  --port  $DEFAULT_PORT"
-    echo "  --dir   $DEFAULT_DIR"
-    echo "  --user  $DEFAULT_USER"
-    echo "  --bind  $DEFAULT_BIND   (use 0.0.0.0 to expose on the network)"
-    echo "  --token <random>        (auto-generated if omitted; enables auth)"
+    echo "  --port       $DEFAULT_PORT"
+    echo "  --dir        $DEFAULT_DIR"
+    echo "  --user       $DEFAULT_USER"
+    echo "  --bind       $DEFAULT_BIND   (use 0.0.0.0 to expose on the network)"
+    echo "  --token      <random>        (auto-generated if omitted; enables auth)"
+    echo "  --max-upload $DEFAULT_MAX_UPLOAD MiB"
+    echo
+    echo "  --allow-host HOST   extra Host header to accept, repeatable."
+    echo "                      Required when serving behind a reverse proxy:"
+    echo "                      e.g. --allow-host files.example.com"
+    echo "                      Requests arriving with any other non-IP Host are"
+    echo "                      rejected, which blocks DNS-rebinding attacks."
     exit 0
 }
 
@@ -52,14 +64,22 @@ SERVE_DIR=$DEFAULT_DIR
 RUN_USER=$DEFAULT_USER
 BIND=$DEFAULT_BIND
 TOKEN=""
+MAX_UPLOAD=$DEFAULT_MAX_UPLOAD
+ALLOW_HOSTS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --port)  PORT=$2;      shift 2 ;;
-        --dir)   SERVE_DIR=$2; shift 2 ;;
-        --user)  RUN_USER=$2;  shift 2 ;;
-        --bind)  BIND=$2;      shift 2 ;;
-        --token) TOKEN=$2;     shift 2 ;;
+        --port|--dir|--user|--bind|--token|--allow-host|--max-upload)
+            [[ $# -ge 2 && -n $2 ]] || die "$1 requires a value" ;;
+    esac
+    case $1 in
+        --port)       PORT=$2;          shift 2 ;;
+        --dir)        SERVE_DIR=$2;     shift 2 ;;
+        --user)       RUN_USER=$2;      shift 2 ;;
+        --bind)       BIND=$2;          shift 2 ;;
+        --token)      TOKEN=$2;         shift 2 ;;
+        --allow-host) ALLOW_HOSTS+=("$2"); shift 2 ;;
+        --max-upload) MAX_UPLOAD=$2;    shift 2 ;;
         -h|--help) usage ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -91,6 +111,39 @@ do_install() {
     # Validate port
     [[ $PORT =~ ^[0-9]+$ ]] && [[ $PORT -ge 1 ]] && [[ $PORT -le 65535 ]] \
         || die "Invalid port: $PORT"
+
+    # Everything below is interpolated into the systemd unit, so anything that
+    # could inject a directive or split ExecStart has to be rejected up front.
+    [[ $SERVE_DIR == /* ]] || die "--dir must be an absolute path: $SERVE_DIR"
+    case $SERVE_DIR in
+        *[$'\n\r\t']*|*' '*) die "--dir must not contain whitespace: $SERVE_DIR" ;;
+    esac
+    [[ $BIND =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $BIND =~ ^[0-9a-fA-F:]+$ ]] \
+        || die "Invalid bind address: $BIND"
+    [[ $RUN_USER =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Invalid user name: $RUN_USER"
+    [[ $MAX_UPLOAD =~ ^[0-9]+$ ]] && (( MAX_UPLOAD > 0 )) \
+        || die "Invalid --max-upload in MiB: $MAX_UPLOAD"
+    case $TOKEN in
+        *[$'\n\r']*) die "--token must not contain newlines" ;;
+    esac
+    if [[ $RUN_USER == root ]]; then
+        red "WARNING: running the service as root is not recommended."
+    fi
+
+    ALLOW_HOST_ARGS=""
+    for h in "${ALLOW_HOSTS[@]}"; do
+        [[ $h =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] \
+            || die "Invalid --allow-host: $h"
+        ALLOW_HOST_ARGS+=" --allow-host $h"
+    done
+
+    # The server holds the request body and its parsed copy in memory at once,
+    # so give systemd a ceiling a few times above the configured upload cap.
+    MEMORY_MAX="$(( MAX_UPLOAD * 4 ))M"
+
+    # ProtectHome would hide a serve directory that lives under /home or /root.
+    PROTECT_HOME="ProtectHome=true"
+    case $SERVE_DIR in /home/*|/root/*) PROTECT_HOME="ProtectHome=read-only" ;; esac
 
     # Validate / create run user
     if ! id -u "$RUN_USER" &>/dev/null; then
@@ -127,9 +180,11 @@ import argparse
 import base64
 import hmac
 import http.server
+import ipaddress
 import json
 import mimetypes
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -142,9 +197,22 @@ from http import HTTPStatus
 STATS_FILE = ".fs_stats.json"
 _stats_lock = threading.Lock()
 
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+MAX_UPLOAD_BYTES = 512 * 1024 * 1024  # 512 MiB
 AUTH_WINDOW = 60
 AUTH_MAX_FAILURES = 5
+SOCKET_TIMEOUT = 60
+
+
+def parse_size(value):
+    """Parse a byte count with an optional k/m/g suffix."""
+    m = re.fullmatch(r"\s*(\d+)\s*([kmgKMG]?)\s*", str(value))
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid size: {value!r}")
+    scale = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}[m.group(2).lower()]
+    size = int(m.group(1)) * scale
+    if size <= 0:
+        raise argparse.ArgumentTypeError("size must be greater than zero")
+    return size
 
 
 # ── stats persistence ─────────────────────────────────────────────────────────
@@ -459,26 +527,85 @@ load();
 class Handler(http.server.BaseHTTPRequestHandler):
     serve_dir = "."
     token = None
+    allowed_hosts = frozenset()
+    max_upload = MAX_UPLOAD_BYTES
+    timeout = SOCKET_TIMEOUT
     _auth_failures = {}
     _auth_lock = threading.Lock()
 
     def log_message(self, fmt, *args):
         print(f"[{self.address_string()}] {fmt % args}", flush=True)
 
+    # ── authentication ────────────────────────────────────────────────────────
+
     def _check_auth(self):
-        if not self.token:
-            return True
+        if self.token is None:
+            return True      # only reachable when started with --no-auth
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Basic "):
             return False
         try:
-            cred = base64.b64decode(auth[6:].strip()).decode("utf-8", errors="replace")
+            cred = base64.b64decode(auth[6:].strip(), validate=True)
+            cred = cred.decode("utf-8")
         except Exception:
             return False
         if ":" not in cred:
             return False
         _, password = cred.split(":", 1)
-        return hmac.compare_digest(password, self.token)
+        # Compare bytes: compare_digest raises TypeError on non-ASCII str.
+        return hmac.compare_digest(password.encode("utf-8"), self.token.encode("utf-8"))
+
+    # ── request origin ────────────────────────────────────────────────────────
+
+    def _hostname_allowed(self, host):
+        """Accept an allow-listed name, a literal IP, or nothing else."""
+        if not host:
+            return False
+        if host.startswith("["):
+            name = host.partition("]")[0][1:]          # [::1]:8080 -> ::1
+        else:
+            name = host.rsplit(":", 1)[0] if ":" in host else host
+        name = name.strip().lower().rstrip(".")
+        if not name:
+            return False
+        if name in self.allowed_hosts:
+            return True
+        try:
+            ipaddress.ip_address(name)
+        except ValueError:
+            return False
+        # A literal IP cannot be reached by DNS rebinding, so it is safe to take.
+        return True
+
+    def _origin_ok(self):
+        """Reject cross-site browser requests, which carry cookies/credentials."""
+        site = self.headers.get("Sec-Fetch-Site", "").lower()
+        if site and site not in ("same-origin", "none"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            if origin == "null":
+                return False
+            try:
+                host = urllib.parse.urlsplit(origin).hostname or ""
+            except ValueError:
+                return False
+            if not self._hostname_allowed(host):
+                return False
+        return True
+
+    def _guard_request(self):
+        host = self.headers.get("Host", "")
+        if not self._hostname_allowed(host):
+            self.log_error("rejected Host %r", host)
+            self.send_json({"error": "Host not allowed. Pass --allow-host <name> to "
+                                     "permit it, or connect using an IP address."}, 403)
+            return False
+        if not self._origin_ok():
+            self.log_error("rejected cross-site request")
+            self.send_json({"error": "Cross-site request rejected."}, 403)
+            return False
+        return True
 
     def _auth_failures_for(self, ip):
         now = time.time()
@@ -512,11 +639,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._guard_request():
+            return
         if not self._require_auth():
             return
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
@@ -532,6 +662,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        if not self._guard_request():
+            return
         if not self._require_auth():
             return
         if self.path == "/upload":
@@ -543,6 +675,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = HTML.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
@@ -552,9 +687,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         files = []
         try:
             for entry in sorted(os.scandir(self.serve_dir), key=lambda e: e.name.lower()):
-                if entry.name.startswith(".") or not entry.is_file():
+                if entry.name.startswith(".") or not entry.is_file(follow_symlinks=False):
                     continue
-                st = entry.stat()
+                st = entry.stat(follow_symlinks=False)
                 fs = stats["files"].get(entry.name, {})
                 files.append({
                     "name":          entry.name,
@@ -564,8 +699,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "bytes_served":  fs.get("bytes", 0),
                     "last_download": fs.get("last", 0),
                 })
-        except Exception as e:
-            self.send_json({"error": str(e)}, 500)
+        except OSError as e:
+            self.log_error("listing %s failed: %s", self.serve_dir, e)
+            self.send_json({"error": "Failed to list files."}, 500)
             return
         self.send_json({"files": files})
 
@@ -578,26 +714,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _download(self, filename):
         filename = filename.replace("\r", "").replace("\n", "").replace('"', "")
-        if not filename or any(p.startswith(".") for p in filename.split("/")):
+        if (not filename or "\x00" in filename
+                or any(p.startswith(".") for p in filename.split("/"))):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        filepath = os.path.realpath(os.path.join(self.serve_dir, filename))
-        root     = os.path.realpath(self.serve_dir)
-        if not (filepath.startswith(root + os.sep) or filepath == root):
-            self.send_error(HTTPStatus.FORBIDDEN)
-            return
-        if not os.path.isfile(filepath):
+        try:
+            filepath = os.path.realpath(os.path.join(self.serve_dir, filename))
+            root     = os.path.realpath(self.serve_dir)
+            if not (filepath.startswith(root + os.sep) or filepath == root):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            if not os.path.isfile(filepath):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            filesize = os.path.getsize(filepath)
+        except OSError:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        filesize = os.path.getsize(filepath)
         record_download(self.serve_dir, filename, filesize)
         mime, _ = mimetypes.guess_type(filename)
         mime = mime or "application/octet-stream"
+        # Header values are latin-1, so a non-latin-1 filename would raise here.
+        # Send an ASCII fallback plus the RFC 5987 form.
+        fallback = re.sub(r"[^A-Za-z0-9._ -]", "_",
+                          filename.encode("ascii", "ignore").decode("ascii")).strip()
         self.send_response(200)
         self.send_header("Content-Type", mime)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", filesize)
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Disposition",
+                         f"attachment; filename=\"{fallback or 'download'}\"; "
+                         f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}")
         self.end_headers()
         with open(filepath, "rb") as f:
             while chunk := f.read(65536):
@@ -625,15 +772,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if length <= 0:
             self.send_json({"error": "Empty request body"}, 400)
             return
-        if length > MAX_UPLOAD_BYTES:
-            self.send_json({"error": f"Upload too large (max {MAX_UPLOAD_BYTES} bytes)"}, 413)
+        if length > self.max_upload:
+            self.send_json({"error": f"Upload too large (max {self.max_upload} bytes)"}, 413)
             return
         try:
             body = self.rfile.read(length)
+        except TimeoutError:
+            raise        # let the handler drop this connection
         except Exception:
             self.send_json({"error": "Failed to read request body"}, 400)
             return
-        if len(body) > MAX_UPLOAD_BYTES:
+        if len(body) > self.max_upload:
             self.send_json({"error": "Upload too large"}, 413)
             return
 
@@ -657,7 +806,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 os.replace(tmp, target)
                 saved.append(filename)
         except Exception as e:
-            self.send_json({"error": f"Upload failed: {e}"}, 400)
+            self.log_error("upload failed: %s", e)
+            self.send_json({"error": "Upload failed."}, 400)
             return
         if saved:
             self.send_json({"saved": saved})
@@ -673,6 +823,12 @@ def main():
     parser.add_argument("--dir",   "-d",           default=".")
     parser.add_argument("--bind",  "-b",           default="127.0.0.1")
     parser.add_argument("--token", "-t",           default=os.environ.get("FS_TOKEN", ""))
+    parser.add_argument("--allow-host", action="append", default=[], metavar="HOST",
+                        help="extra Host header value to accept (repeatable)")
+    parser.add_argument("--max-upload", type=parse_size, default=MAX_UPLOAD_BYTES,
+                        metavar="SIZE", help="maximum upload size, e.g. 512m or 1g")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="disable authentication entirely (not recommended)")
     args = parser.parse_args()
 
     serve_dir = os.path.abspath(args.dir)
@@ -680,13 +836,35 @@ def main():
         print(f"Error: '{serve_dir}' is not a directory.")
         sys.exit(1)
 
+    # Fail closed: an unset token is a configuration error, not a free pass.
+    if args.no_auth:
+        token = None
+    elif args.token:
+        token = args.token
+    else:
+        print("Error: no auth token. Pass --token, set FS_TOKEN, or pass")
+        print("       --no-auth to run without authentication.")
+        sys.exit(1)
+
+    allowed = {"localhost", "::1"}
+    if args.bind not in ("0.0.0.0", "::"):
+        allowed.add(args.bind.lower())
+    allowed.update(h.strip().lower() for h in args.allow_host if h.strip())
+
     Handler.serve_dir = serve_dir
-    Handler.token = args.token or None
+    Handler.token = token
+    Handler.allowed_hosts = frozenset(allowed)
+    Handler.max_upload = args.max_upload
     server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
 
     print(f"Serving : {serve_dir}")
     print(f"Endpoint: http://{args.bind}:{args.port}/")
-    print("Auth    : " + ("enabled (HTTP Basic)" if Handler.token else "DISABLED — no token set"))
+    print(f"Max upl : {args.max_upload // (1024 * 1024)} MiB")
+    print("Hosts   : " + ", ".join(sorted(allowed)) + " (and any bare IP)")
+    if token is None:
+        print("Auth    : DISABLED via --no-auth")
+    else:
+        print("Auth    : enabled (HTTP Basic)")
 
     try:
         server.serve_forever()
@@ -711,15 +889,27 @@ After=network.target
 Type=simple
 User=${RUN_USER}
 Group=${RUN_USER}
-EnvironmentFile=-${INSTALL_DIR}/.fs_token
-ExecStart=/usr/bin/python3 ${INSTALL_DIR}/serve.py --port ${PORT} --dir ${SERVE_DIR} --bind ${BIND}
+# No leading '-' : the service must refuse to start without its token.
+EnvironmentFile=${INSTALL_DIR}/.fs_token
+ExecStart=/usr/bin/python3 ${INSTALL_DIR}/serve.py --port ${PORT} --dir ${SERVE_DIR} --bind ${BIND} --max-upload ${MAX_UPLOAD}m${ALLOW_HOST_ARGS}
 Restart=on-failure
 RestartSec=5
-# Harden a bit
+# Hardening
 PrivateTmp=true
 NoNewPrivileges=true
 ProtectSystem=strict
+${PROTECT_HOME}
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
 ReadWritePaths=${SERVE_DIR}
+MemoryMax=${MEMORY_MAX}
+TasksMax=64
 
 [Install]
 WantedBy=multi-user.target
@@ -738,6 +928,8 @@ EOF
     bold "  Port            : $PORT"
     bold "  Bind            : $BIND"
     bold "  Service user    : $RUN_USER"
+    bold "  Max upload      : ${MAX_UPLOAD} MiB"
+    bold "  Extra hosts     : ${ALLOW_HOSTS[*]:-<none>}"
     bold "  Python script   : $INSTALL_DIR/serve.py"
     bold "  Service file    : $SERVICE_FILE"
     echo
@@ -745,6 +937,18 @@ EOF
     cyan "  Authenticate with: curl -u :$TOKEN http://<host>:${PORT}/"
     echo
     cyan "  Open: http://$(hostname -I | awk '{print $1}'):${PORT}/"
+    if [[ $BIND == 0.0.0.0 ]]; then
+        echo
+        red  "  WARNING: bound to 0.0.0.0 and serving plain HTTP. The token is"
+        red  "           sent in cleartext on every request — use a TLS reverse"
+        red  "           proxy (see README) instead of exposing this directly."
+    fi
+    if [[ -z $ALLOW_HOST_ARGS ]]; then
+        echo
+        echo "  Note: requests are accepted by IP or as 'localhost'. If you put a"
+        echo "        TLS proxy in front, re-run with --allow-host <your.domain>"
+        echo "        or the proxy will get 403 responses."
+    fi
     echo
     echo "  Useful commands:"
     echo "    systemctl status  $SERVICE_NAME"

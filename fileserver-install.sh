@@ -2,20 +2,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # fileserver — install / update / status / uninstall script
 # Usage:
-#   sudo ./fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
-#                                       [--bind ADDR] [--token TOKEN]
-#                                       [--allow-host HOST]... [--max-upload MiB]
-#   sudo ./fileserver-install.sh update  [--force] [--dry-run]
-#   sudo ./fileserver-install.sh status
-#   sudo ./fileserver-install.sh uninstall
+#   sudo bash fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
+#                                           [--bind ADDR] [--token TOKEN]
+#                                           [--allow-host HOST]... [--max-upload MiB]
+#   sudo bash fileserver-install.sh update  [--force] [--dry-run] [--init-token]
+#   sudo bash fileserver-install.sh status
+#   sudo bash fileserver-install.sh uninstall
 #
 # `update` re-applies the serve.py and unit built into *this* script, keeping the
 # deployed settings and auth token. It does no network I/O: re-run the README
-# curl to fetch a newer script, then run `update` from it.
+# curl to fetch a newer script, then run `update` from it. Installs that predate
+# authentication have no token to keep; updating one needs --init-token.
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -40,23 +41,24 @@ bold()  { echo -e "\033[1m$*\033[0m"; }
 die()   { red "ERROR: $*"; exit 1; }
 
 require_root() {
-    [[ $EUID -eq 0 ]] || die "Run as root: sudo $0"
+    [[ $EUID -eq 0 ]] || die "Run as root: sudo bash $0"
 }
 
 usage() {
     bold "fileserver install script (v$VERSION)"
     echo
-    echo "  sudo $0 install   [--port PORT] [--dir DIR] [--user USER]"
-    echo "                    [--bind ADDR] [--token TOKEN]"
-    echo "                    [--allow-host HOST]... [--max-upload MiB]"
-    echo "  sudo $0 update    [--force] [--dry-run]"
-    echo "  sudo $0 status"
-    echo "  sudo $0 uninstall"
+    echo "  sudo bash $0 install   [--port PORT] [--dir DIR] [--user USER]"
+    echo "                         [--bind ADDR] [--token TOKEN]"
+    echo "                         [--allow-host HOST]... [--max-upload MiB]"
+    echo "  sudo bash $0 update    [--force] [--dry-run] [--init-token]"
+    echo "  sudo bash $0 status"
+    echo "  sudo bash $0 uninstall"
     echo
     echo "  update applies the server and unit built into this script to an"
     echo "  existing install. Deployed settings and the auth token are kept."
     echo "  --force    re-apply even if the version already matches (or is newer)"
     echo "  --dry-run  show what update would change, then stop"
+    echo "  --init-token  generate a token for an install that predates auth"
     echo
     echo "Defaults:"
     echo "  --port       $DEFAULT_PORT"
@@ -90,6 +92,7 @@ MAX_UPLOAD=""
 ALLOW_HOSTS=()
 FORCE=0
 DRY_RUN=0
+INIT_TOKEN=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -106,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         --max-upload) MAX_UPLOAD=$2;    shift 2 ;;
         --force)      FORCE=1;          shift ;;
         --dry-run)    DRY_RUN=1;        shift ;;
+        --init-token) INIT_TOKEN=1;     shift ;;
         -h|--help) usage ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -1092,6 +1096,29 @@ version_gt() {
         && [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
 }
 
+# ── auth token ────────────────────────────────────────────────────────────────
+
+generate_token() {
+    if command -v openssl &>/dev/null; then
+        openssl rand -hex 24
+    else
+        head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    fi
+}
+
+write_token_file() {
+    printf 'FS_TOKEN=%s\n' "$1" > "$TOKEN_FILE"
+    chown root:root "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+}
+
+# Installs predating authentication have no token file *and* no mention of one
+# in the unit. That is very different from a token file that went missing, so
+# this is what tells "merely old" apart from "actually broken".
+unit_references_token() {
+    grep -qE 'EnvironmentFile=.*fs_token|--token[ =]' "$SERVICE_FILE" 2>/dev/null
+}
+
 # ── install ───────────────────────────────────────────────────────────────────
 do_install() {
     require_root
@@ -1127,16 +1154,8 @@ version without rotating the auth token, or 'install --force' to reinstall from 
     chmod 755 "$SERVE_DIR"
 
     # ── auth token ────────────────────────────────────────────────────────────
-    if [[ -z "$TOKEN" ]]; then
-        if command -v openssl &>/dev/null; then
-            TOKEN=$(openssl rand -hex 24)
-        else
-            TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        fi
-    fi
-    printf 'FS_TOKEN=%s\n' "$TOKEN" > "$TOKEN_FILE"
-    chown root:root "$TOKEN_FILE"
-    chmod 600 "$TOKEN_FILE"
+    [[ -n $TOKEN ]] || TOKEN=$(generate_token)
+    write_token_file "$TOKEN"
 
     # ── write server + unit ───────────────────────────────────────────────────
     # Same-directory temp then rename, so an interrupted run cannot leave a
@@ -1211,14 +1230,32 @@ do_update() {
     command -v systemctl &>/dev/null || die "systemd is required for update."
 
     if [[ -n $PORT || -n $SERVE_DIR || -n $RUN_USER || -n $BIND || -n $MAX_UPLOAD \
-          || ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+          || -n $TOKEN || ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
         die "update takes no settings — it keeps the deployed ones.
        Change them by editing $CONFIG_FILE and re-running update."
     fi
 
     [[ -f $INSTALL_DIR/serve.py ]] || die "Not installed: $INSTALL_DIR/serve.py is missing. Run 'install' first."
     [[ -f $SERVICE_FILE ]]         || die "Not installed: $SERVICE_FILE is missing. Run 'install' first."
-    [[ -f $TOKEN_FILE ]]           || die "Auth token $TOKEN_FILE is missing; refusing to touch a broken install."
+
+    # Everything from the auth-introducing release onward needs a token, so its
+    # absence means one of two very different things — tell them apart rather
+    # than calling both "broken".
+    local mint_token=0 token_created=0
+    if [[ ! -f $TOKEN_FILE ]]; then
+        if unit_references_token; then
+            die "$SERVICE_FILE refers to $TOKEN_FILE, but that file is missing.
+       This install is broken rather than merely old — restore the token from a
+       backup, or run 'install --force' to rebuild from scratch."
+        fi
+        if [[ $INIT_TOKEN -eq 0 ]]; then
+            die "This install predates authentication: there is no $TOKEN_FILE and
+       no token in $SERVICE_FILE. The current server refuses to start without
+       one, so updating means generating a token, and every client must then
+       authenticate. Re-run with --init-token to accept that."
+        fi
+        mint_token=1
+    fi
 
     # ── gather the deployed settings ─────────────────────────────────────────
     if read_config; then
@@ -1232,7 +1269,18 @@ do_update() {
         if [[ -z $PORT ]]; then       PORT=$DEFAULT_PORT;           fell_back+=" port"; fi
         if [[ -z $SERVE_DIR ]]; then  SERVE_DIR=$DEFAULT_DIR;       fell_back+=" dir"; fi
         if [[ -z $RUN_USER ]]; then   RUN_USER=$DEFAULT_USER;       fell_back+=" user"; fi
-        if [[ -z $BIND ]]; then       BIND=$DEFAULT_BIND;           fell_back+=" bind"; fi
+        if [[ -z $BIND ]]; then
+            # No --bind in the unit means a pre-auth install, whose server
+            # defaulted to 0.0.0.0. Falling back to loopback here would quietly
+            # drop the box off the network, so keep what is actually running.
+            if unit_references_token; then
+                BIND=$DEFAULT_BIND
+                fell_back+=" bind"
+            else
+                BIND="0.0.0.0"
+                fell_back+=" bind(kept 0.0.0.0)"
+            fi
+        fi
         if [[ -z $MAX_UPLOAD ]]; then MAX_UPLOAD=$DEFAULT_MAX_UPLOAD; fell_back+=" max-upload"; fi
         if [[ -n $fell_back ]]; then
             red "WARNING: not present in the unit, defaulting:${fell_back}"
@@ -1275,7 +1323,11 @@ do_update() {
         echo  "                  to $BACKUP_DIR/"
         echo  "  Would rewrite   both from this script (v$VERSION)"
         echo  "  Would restart   $SERVICE_NAME and verify it answers /api/files"
-        echo  "  Token           $TOKEN_FILE left untouched"
+        if [[ $mint_token -eq 1 ]]; then
+            echo  "  Token           would be generated at $TOKEN_FILE"
+        else
+            echo  "  Token           $TOKEN_FILE left untouched"
+        fi
         return 0
     fi
 
@@ -1311,6 +1363,15 @@ do_update() {
     mkdir -p "$SERVE_DIR"
     chown "$RUN_USER":"$RUN_USER" "$SERVE_DIR"
 
+    if [[ $mint_token -eq 1 ]]; then
+        TOKEN=$(generate_token)
+        write_token_file "$TOKEN"
+        token_created=1
+        cyan "This install predates authentication — generated a token:"
+        bold "  $TOKEN"
+        echo
+    fi
+
     cyan "Writing server v$VERSION..."
     local tmp_py="${INSTALL_DIR}/.serve.py.new"
     write_serve_py "$tmp_py"
@@ -1339,7 +1400,12 @@ do_update() {
         chmod 644 "$VERSION_FILE"
         echo
         green "✓ Updated to v$VERSION (was ${deployed:-unrecorded})."
-        echo "  Auth token unchanged; clients keep working."
+        if [[ $token_created -eq 1 ]]; then
+            echo "  Auth is now required. New token:"
+            bold "  $TOKEN"
+        else
+            echo "  Auth token unchanged; clients keep working."
+        fi
         echo "  Backup: $backup"
         return 0
     fi
@@ -1347,6 +1413,10 @@ do_update() {
     red "✗ v$VERSION did not come up healthy. Rolling back..."
     cp -p "$backup/serve.py" "$INSTALL_DIR/serve.py"
     cp -p "$backup/${SERVICE_NAME}.service" "$SERVICE_FILE"
+    if [[ $token_created -eq 1 ]]; then
+        # Put the pre-auth state back exactly; the restored unit has no token.
+        rm -f "$TOKEN_FILE"
+    fi
     systemctl daemon-reload || true
     systemctl restart "$SERVICE_NAME" || true
     echo
@@ -1400,7 +1470,11 @@ do_status() {
     if [[ -f $TOKEN_FILE ]]; then
         echo "  Auth token      : set, $(stat -c '%U:%G %a' "$TOKEN_FILE" 2>/dev/null || echo 'perms unknown') (value not shown)"
     else
-        red "  Auth token      : MISSING — the service cannot start without it"
+        if [[ -f $SERVICE_FILE ]] && ! unit_references_token; then
+            cyan "  Auth token      : none (this install predates authentication)"
+        else
+            red "  Auth token      : MISSING — the service cannot start without it"
+        fi
     fi
     echo
 

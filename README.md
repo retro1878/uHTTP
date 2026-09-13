@@ -6,29 +6,29 @@ minimal HTTP file server — upload, browse, download.
 curl -fsSL https://raw.githubusercontent.com/retro1878/uHTTP/main/fileserver-install.sh -o fileserver-install.sh
 ```
 
-```sh
-chmod +x fileserver-install.sh
-```
+`curl` does not set the executable bit, so the examples below run the script
+with `bash`. `chmod +x fileserver-install.sh` and `./fileserver-install.sh` work
+just as well if you prefer.
 
 ```sh
 # install with defaults (port 8080, /srv/fileserver, www-data, localhost-only,
 # auto-generated auth token, 512 MiB upload limit)
-sudo ./fileserver-install.sh install
+sudo bash fileserver-install.sh install
 ```
 
 ```sh
 # custom port, directory, service user, and token
-sudo ./fileserver-install.sh install --port 9000 --dir /opt/files --user nobody --token "$(openssl rand -hex 24)"
+sudo bash fileserver-install.sh install --port 9000 --dir /opt/files --user nobody --token "$(openssl rand -hex 24)"
 ```
 
 ```sh
 # reachable from the LAN: bind to an address and raise the upload limit
-sudo ./fileserver-install.sh install --bind 192.168.1.5 --max-upload 2048
+sudo bash fileserver-install.sh install --bind 192.168.1.5 --max-upload 2048
 ```
 
 ```sh
 # remove service and install dir (leaves your files intact)
-sudo ./fileserver-install.sh uninstall
+sudo bash fileserver-install.sh uninstall
 ```
 
 no dependencies beyond python3 and systemd.
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/retro1878/uHTTP/main/fileserver-ins
 
 ```sh
 # 2. apply it
-sudo ./fileserver-install.sh update
+sudo bash fileserver-install.sh update
 ```
 
 the script does no network i/o of its own — you only ever run a script you
@@ -58,22 +58,33 @@ and the token is left untouched, so connected clients keep working. re-running
 token. installs from before v1.1 have no `.fs_config`; the first `update`
 recovers the settings from the existing unit and writes that file.
 
+installs from before authentication was added have no token file at all. the
+server refuses to start without one, so `update` declines those until you pass
+`--init-token`, which generates a token — after which every client must
+authenticate. those installs also listened on every interface (their unit had no
+`--bind`), so that is preserved rather than quietly narrowed to localhost.
+
 if the service does not come back healthy, the previous server and unit are
 restored automatically and the update exits non-zero.
 
 ```sh
 # version, settings and service state
-sudo ./fileserver-install.sh status
+sudo bash fileserver-install.sh status
 ```
 
 ```sh
 # show what an update would change, and change nothing
-sudo ./fileserver-install.sh update --dry-run
+sudo bash fileserver-install.sh update --dry-run
 ```
 
 ```sh
 # re-apply, or override a downgrade refusal
-sudo ./fileserver-install.sh update --force
+sudo bash fileserver-install.sh update --force
+```
+
+```sh
+# an install from before authentication: generate a token, then apply
+sudo bash fileserver-install.sh update --init-token
 ```
 
 to change a setting, edit `/opt/fileserver/.fs_config` (root-only) and re-run
@@ -112,7 +123,7 @@ localhost server via DNS rebinding. if you reach the server by hostname, includi
 through a reverse proxy, name it at install time:
 
 ```sh
-sudo ./fileserver-install.sh install --bind 0.0.0.0 --allow-host files.example.com
+sudo bash fileserver-install.sh install --bind 0.0.0.0 --allow-host files.example.com
 ```
 
 `--allow-host` is repeatable. cross-site browser requests (per `Origin` and

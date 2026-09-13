@@ -1,6 +1,6 @@
 # uHTTP
 
-minimal HTTP file server — upload, browse, download.
+minimal HTTP file server — upload, browse, download, delete.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/retro1878/uHTTP/main/fileserver-install.sh -o fileserver-install.sh
@@ -97,10 +97,19 @@ under `/opt/fileserver/backups/`.
 download count and last-download time, plus click-or-drag upload. every route is
 behind the token, so the browser asks for credentials before the page loads.
 
+each row has a **delete** button beside its download link. it asks for
+confirmation, then removes the file and its per-file download counters. the
+browse page is the only thing that lists files, so anything it does not show —
+dotfiles like `.fs_stats.json`, symlinks, subdirectories — cannot be deleted
+through the API either. the running totals in the header are left alone; they
+are a record of what has been served, not of what is currently on disk.
+
 ## auth
 
 the installer generates a random token on install (or use `--token`) and prints it at the end.
-all routes require http basic auth — the password is the token, the username is ignored.
+all routes require http basic auth — the password is the token, the username is ignored. that
+includes deleting, so the token is a full read/write credential: give it only to people who
+should be able to remove files.
 
 ```sh
 curl -u :TOKEN http://localhost:8080/api/files

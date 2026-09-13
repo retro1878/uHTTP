@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -267,6 +267,15 @@ def record_download(serve_dir, filename, filesize):
         save_stats(serve_dir, stats)
 
 
+def forget_file_stats(serve_dir, filename):
+    """Drop a deleted file's counters. The running totals are history, so they stay."""
+    with _stats_lock:
+        stats = load_stats(serve_dir)
+        if stats["files"].pop(filename, None) is None:
+            return
+        save_stats(serve_dir, stats)
+
+
 # ── HTML UI ───────────────────────────────────────────────────────────────────
 
 HTML = """<!DOCTYPE html>
@@ -284,7 +293,7 @@ HTML = """<!DOCTYPE html>
   --border:#202020;--border-dim:#181818;
   --text:#d4d4d4;--muted:#4a4a4a;--muted2:#666;
   --accent:#3ddc97;--accent-dim:rgba(61,220,151,.1);--accent-glow:rgba(61,220,151,.25);
-  --red:#ff5f5f;--font:'IBM Plex Mono',monospace
+  --red:#ff5f5f;--red-dim:rgba(255,95,95,.1);--font:'IBM Plex Mono',monospace
 }
 html,body{height:100%}
 body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.5}
@@ -363,6 +372,17 @@ tbody td{padding:9px 8px;vertical-align:middle}
   letter-spacing:.04em
 }
 .dl-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim)}
+
+/* row actions: the delete button sits beside the download button */
+.row-actions{float:right;display:flex;gap:6px;align-items:center}
+.row-actions .dl-btn{float:none}
+.rm-btn{
+  background:none;border:1px solid var(--border);
+  color:var(--muted2);padding:4px 10px;border-radius:2px;
+  cursor:pointer;font-family:var(--font);font-size:11px;font-weight:500;
+  transition:all .15s;letter-spacing:.04em
+}
+.rm-btn:hover{border-color:var(--red);color:var(--red);background:var(--red-dim)}
 
 .empty{text-align:center;padding:48px;color:var(--muted2);font-size:12px}
 
@@ -492,13 +512,34 @@ async function load() {
         + '<td><span class="fsize">'+fmtSize(f.size)+'</span></td>'
         + '<td><span class="fdl'+dlClass+'">'+f.downloads+'&times;</span></td>'
         + '<td><span class="flast">'+fmtAge(f.last_download)+'</span></td>'
-        + '<td><a class="dl-btn" href="/dl/'+encodeURIComponent(f.name)+'">&#8595; download</a></td>'
+        + '<td><div class="row-actions">'
+        +   '<a class="dl-btn" href="/dl/'+encodeURIComponent(f.name)+'">&#8595; download</a>'
+        +   '<button class="rm-btn" data-name="'+esc(f.name)+'">&#10005; delete</button>'
+        + '</div></td>'
         + '</tr>';
     }).join('');
   } catch(e) {
     toast('failed to load files', true);
   }
 }
+
+async function del(name) {
+  if (!confirm(`delete "${name}"?\\nthis cannot be undone.`)) return;
+  try {
+    const r = await fetch('/api/files/' + encodeURIComponent(name), {method:'DELETE'});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    toast('deleted ' + name);
+    load();
+  } catch(e) {
+    toast(name + ': ' + e.message, true);
+  }
+}
+
+$('tbody').addEventListener('click', e => {
+  const b = e.target.closest ? e.target.closest('.rm-btn') : null;
+  if (b) del(b.dataset.name);
+});
 
 // ── upload ────────────────────────────────────────────────────────────────────
 const zone = $('zone'), finput = $('finput');
@@ -693,6 +734,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
+    def do_DELETE(self):
+        if not self._guard_request():
+            return
+        if not self._require_auth():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/api/files/"):
+            self._delete(urllib.parse.unquote(path[len("/api/files/"):]))
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
+
     def _serve_html(self):
         body = HTML.encode()
         self.send_response(200)
@@ -771,6 +823,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(filepath, "rb") as f:
             while chunk := f.read(65536):
                 self.wfile.write(chunk)
+
+    def _delete(self, filename):
+        # Reject rather than normalise: stripping a "/" or ".." would delete a
+        # file other than the one asked for. _api_files only ever lists plain,
+        # dot-free, regular files directly in the serve dir, so anything else
+        # arriving here did not come from the UI.
+        if (not filename or filename.startswith(".")
+                or any(c in filename for c in "/\\\x00\r\n")):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        filepath = os.path.join(self.serve_dir, filename)
+        try:
+            root = os.path.realpath(self.serve_dir)
+            real = os.path.realpath(filepath)
+            if not real.startswith(root + os.sep):
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            # isfile follows symlinks, islink does not: require the entry itself
+            # to be a regular file, so a link is never removed via its target.
+            if not os.path.isfile(filepath) or os.path.islink(filepath):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            os.remove(filepath)
+        except OSError as e:
+            self.log_error("delete %r failed: %s", filename, e)
+            self.send_json({"error": "Failed to delete file."}, 500)
+            return
+        forget_file_stats(self.serve_dir, filename)
+        self.send_json({"deleted": filename})
 
     def _upload(self):
         ct = self.headers.get("Content-Type", "")

@@ -2,12 +2,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # fileserver — install / update / status / uninstall script
 # Usage:
-#   sudo ./fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
-#                                       [--bind ADDR] [--token TOKEN]
-#                                       [--allow-host HOST]... [--max-upload MiB]
-#   sudo ./fileserver-install.sh update  [--force] [--dry-run]
-#   sudo ./fileserver-install.sh status
-#   sudo ./fileserver-install.sh uninstall
+#   sudo bash fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
+#                                           [--bind ADDR] [--token TOKEN]
+#                                           [--allow-host HOST]... [--max-upload MiB]
+#   sudo bash fileserver-install.sh update  [--force] [--dry-run]
+#   sudo bash fileserver-install.sh status
+#   sudo bash fileserver-install.sh uninstall
 #
 # `update` re-applies the serve.py and unit built into *this* script, keeping the
 # deployed settings and auth token. It does no network I/O: re-run the README
@@ -40,18 +40,18 @@ bold()  { echo -e "\033[1m$*\033[0m"; }
 die()   { red "ERROR: $*"; exit 1; }
 
 require_root() {
-    [[ $EUID -eq 0 ]] || die "Run as root: sudo $0"
+    [[ $EUID -eq 0 ]] || die "Run as root: sudo bash $0"
 }
 
 usage() {
     bold "fileserver install script (v$VERSION)"
     echo
-    echo "  sudo $0 install   [--port PORT] [--dir DIR] [--user USER]"
-    echo "                    [--bind ADDR] [--token TOKEN]"
-    echo "                    [--allow-host HOST]... [--max-upload MiB]"
-    echo "  sudo $0 update    [--force] [--dry-run]"
-    echo "  sudo $0 status"
-    echo "  sudo $0 uninstall"
+    echo "  sudo bash $0 install   [--port PORT] [--dir DIR] [--user USER]"
+    echo "                         [--bind ADDR] [--token TOKEN]"
+    echo "                         [--allow-host HOST]... [--max-upload MiB]"
+    echo "  sudo bash $0 update    [--force] [--dry-run]"
+    echo "  sudo bash $0 status"
+    echo "  sudo bash $0 uninstall"
     echo
     echo "  update applies the server and unit built into this script to an"
     echo "  existing install. Deployed settings and the auth token are kept."

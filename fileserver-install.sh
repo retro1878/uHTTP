@@ -1,17 +1,29 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# fileserver — install / uninstall script
+# fileserver — install / update / status / uninstall script
 # Usage:
 #   sudo ./fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
 #                                       [--bind ADDR] [--token TOKEN]
 #                                       [--allow-host HOST]... [--max-upload MiB]
+#   sudo ./fileserver-install.sh update  [--force] [--dry-run]
+#   sudo ./fileserver-install.sh status
 #   sudo ./fileserver-install.sh uninstall
+#
+# `update` re-applies the serve.py and unit built into *this* script, keeping the
+# deployed settings and auth token. It does no network I/O: re-run the README
+# curl to fetch a newer script, then run `update` from it.
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
+
+VERSION="1.1.0"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+CONFIG_FILE="${INSTALL_DIR}/.fs_config"
+VERSION_FILE="${INSTALL_DIR}/.fs_version"
+TOKEN_FILE="${INSTALL_DIR}/.fs_token"
+BACKUP_DIR="${INSTALL_DIR}/backups"
 
 DEFAULT_PORT=8080
 DEFAULT_DIR="/srv/fileserver"
@@ -32,12 +44,19 @@ require_root() {
 }
 
 usage() {
-    bold "fileserver install script"
+    bold "fileserver install script (v$VERSION)"
     echo
     echo "  sudo $0 install   [--port PORT] [--dir DIR] [--user USER]"
     echo "                    [--bind ADDR] [--token TOKEN]"
     echo "                    [--allow-host HOST]... [--max-upload MiB]"
+    echo "  sudo $0 update    [--force] [--dry-run]"
+    echo "  sudo $0 status"
     echo "  sudo $0 uninstall"
+    echo
+    echo "  update applies the server and unit built into this script to an"
+    echo "  existing install. Deployed settings and the auth token are kept."
+    echo "  --force    re-apply even if the version already matches (or is newer)"
+    echo "  --dry-run  show what update would change, then stop"
     echo
     echo "Defaults:"
     echo "  --port       $DEFAULT_PORT"
@@ -59,13 +78,18 @@ usage() {
 [[ $# -lt 1 ]] && usage
 CMD=$1; shift
 
-PORT=$DEFAULT_PORT
-SERVE_DIR=$DEFAULT_DIR
-RUN_USER=$DEFAULT_USER
-BIND=$DEFAULT_BIND
+# Left unset on purpose: install fills in the defaults, update reads the
+# deployed values off disk, and an empty value here is how update detects a
+# setting passed on the command line (which update does not accept).
+PORT=""
+SERVE_DIR=""
+RUN_USER=""
+BIND=""
 TOKEN=""
-MAX_UPLOAD=$DEFAULT_MAX_UPLOAD
+MAX_UPLOAD=""
 ALLOW_HOSTS=()
+FORCE=0
+DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -80,6 +104,8 @@ while [[ $# -gt 0 ]]; do
         --token)      TOKEN=$2;         shift 2 ;;
         --allow-host) ALLOW_HOSTS+=("$2"); shift 2 ;;
         --max-upload) MAX_UPLOAD=$2;    shift 2 ;;
+        --force)      FORCE=1;          shift ;;
+        --dry-run)    DRY_RUN=1;        shift ;;
         -h|--help) usage ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -88,6 +114,14 @@ done
 # ── uninstall ─────────────────────────────────────────────────────────────────
 do_uninstall() {
     require_root
+
+    # Best-effort only, for the closing note: uninstall must still work on a
+    # broken install, so this reads the config without validating it.
+    local deployed_dir="$DEFAULT_DIR"
+    if [[ -f $CONFIG_FILE ]]; then
+        deployed_dir=$(grep -m1 '^SERVE_DIR=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- || true)
+    fi
+    [[ -n $deployed_dir ]] || deployed_dir="$DEFAULT_DIR"
 
     cyan "Stopping and disabling service..."
     systemctl stop  "$SERVICE_NAME" 2>/dev/null || true
@@ -101,13 +135,14 @@ do_uninstall() {
     rm -rf "$INSTALL_DIR"
 
     green "✓ fileserver uninstalled."
-    echo  "  Serve directory $SERVE_DIR and its contents were NOT removed."
+    echo  "  Serve directory $deployed_dir and its contents were NOT removed."
 }
 
-# ── install ───────────────────────────────────────────────────────────────────
-do_install() {
-    require_root
+# ── validation ────────────────────────────────────────────────────────────────
 
+# Applied to settings from the command line and, on update, to values read back
+# off disk — so it never trusts its input.
+validate_config() {
     # Validate port
     [[ $PORT =~ ^[0-9]+$ ]] && [[ $PORT -ge 1 ]] && [[ $PORT -le 65535 ]] \
         || die "Invalid port: $PORT"
@@ -129,7 +164,10 @@ do_install() {
     if [[ $RUN_USER == root ]]; then
         red "WARNING: running the service as root is not recommended."
     fi
+}
 
+# Derived from the validated config, immediately before the unit is rendered.
+prepare_unit_vars() {
     ALLOW_HOST_ARGS=""
     for h in "${ALLOW_HOSTS[@]}"; do
         [[ $h =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] \
@@ -144,35 +182,15 @@ do_install() {
     # ProtectHome would hide a serve directory that lives under /home or /root.
     PROTECT_HOME="ProtectHome=true"
     case $SERVE_DIR in /home/*|/root/*) PROTECT_HOME="ProtectHome=read-only" ;; esac
+}
 
-    # Validate / create run user
-    if ! id -u "$RUN_USER" &>/dev/null; then
-        cyan "Creating system user '$RUN_USER'..."
-        useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER"
-    fi
+# ── embedded server source ────────────────────────────────────────────────────
 
-    # Create directories
-    cyan "Creating directories..."
-    mkdir -p "$INSTALL_DIR"
-    mkdir -p "$SERVE_DIR"
-    chown "$RUN_USER":"$RUN_USER" "$SERVE_DIR"
-    chmod 755 "$SERVE_DIR"
-
-    # ── auth token ────────────────────────────────────────────────────────────
-    if [[ -z "$TOKEN" ]]; then
-        if command -v openssl &>/dev/null; then
-            TOKEN=$(openssl rand -hex 24)
-        else
-            TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        fi
-    fi
-    printf 'FS_TOKEN=%s\n' "$TOKEN" > "$INSTALL_DIR/.fs_token"
-    chown root:root "$INSTALL_DIR/.fs_token"
-    chmod 600 "$INSTALL_DIR/.fs_token"
-
-    # ── write Python server ───────────────────────────────────────────────────
-    cyan "Writing server..."
-    cat > "$INSTALL_DIR/serve.py" << 'PYEOF'
+# Writes the Python server to $1. Install and update both call this, so the
+# server the two ship can never drift apart.
+write_serve_py() {
+    local dest=$1
+    cat > "$dest" << 'PYEOF'
 #!/usr/bin/env python3
 """fileserver — minimal HTTP file server with web UI, upload, and download tracking."""
 
@@ -874,13 +892,14 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
+}
 
-    chmod +x "$INSTALL_DIR/serve.py"
-    chown root:root "$INSTALL_DIR/serve.py"
+# ── systemd unit ──────────────────────────────────────────────────────────────
 
-    # ── write systemd service ─────────────────────────────────────────────────
-    cyan "Creating systemd service..."
-    cat > "$SERVICE_FILE" << EOF
+# Renders the unit from the validated config to $1. Install and update share it.
+render_unit() {
+    local dest=$1
+    cat > "$dest" << EOF
 [Unit]
 Description=fileserver — HTTP file server with web UI
 After=network.target
@@ -914,24 +933,253 @@ TasksMax=64
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
-    # ── enable + start ────────────────────────────────────────────────────────
-    cyan "Enabling and starting service..."
-    systemctl daemon-reload
-    systemctl enable --now "$SERVICE_NAME"
-
-    # ── done ──────────────────────────────────────────────────────────────────
-    echo
-    green "✓ fileserver installed and running."
-    echo
+print_config() {
     bold "  Serve directory : $SERVE_DIR"
     bold "  Port            : $PORT"
     bold "  Bind            : $BIND"
     bold "  Service user    : $RUN_USER"
     bold "  Max upload      : ${MAX_UPLOAD} MiB"
     bold "  Extra hosts     : ${ALLOW_HOSTS[*]:-<none>}"
+}
+
+# ── config persistence ────────────────────────────────────────────────────────
+#
+# .fs_config is the single source of truth for a deployed instance; the unit is
+# rendered from it. It is written 0600 root:root and read back with the strict
+# parser below.
+
+write_config() {
+    local tmp="${CONFIG_FILE}.tmp"
+    {
+        printf 'PORT=%s\n'        "$PORT"
+        printf 'SERVE_DIR=%s\n'   "$SERVE_DIR"
+        printf 'RUN_USER=%s\n'    "$RUN_USER"
+        printf 'BIND=%s\n'        "$BIND"
+        printf 'MAX_UPLOAD=%s\n'  "$MAX_UPLOAD"
+        printf 'ALLOW_HOSTS=%s\n' "${ALLOW_HOSTS[*]:-}"
+    } > "$tmp"
+    chown root:root "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+}
+
+# Deliberately does NOT `source` the file: this runs as root, so sourcing would
+# execute whatever it happens to contain. Every value is also re-validated by
+# validate_config() before it reaches the unit.
+read_config() {
+    [[ -f $CONFIG_FILE ]] || return 1
+
+    local owner mode
+    owner=$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || echo '?')
+    mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || echo '?')
+    [[ $owner == root && $mode == 600 ]] \
+        || die "$CONFIG_FILE must be root-owned mode 600 (found ${owner}:${mode}); refusing to read it."
+
+    PORT=""; SERVE_DIR=""; RUN_USER=""; BIND=""; MAX_UPLOAD=""; ALLOW_HOSTS=()
+
+    local line key value
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ -z $line || $line == \#* ]]; then
+            continue
+        fi
+        key=${line%%=*}
+        value=${line#*=}
+        case $key in
+            PORT)        PORT=$value ;;
+            SERVE_DIR)   SERVE_DIR=$value ;;
+            RUN_USER)    RUN_USER=$value ;;
+            BIND)        BIND=$value ;;
+            MAX_UPLOAD)  MAX_UPLOAD=$value ;;
+            ALLOW_HOSTS)
+                ALLOW_HOSTS=()
+                if [[ -n $value ]]; then
+                    read -r -a ALLOW_HOSTS <<< "$value"
+                fi
+                ;;
+            *) die "$CONFIG_FILE: unexpected key '$key'" ;;
+        esac
+    done < "$CONFIG_FILE"
+
+    [[ -n $PORT && -n $SERVE_DIR && -n $RUN_USER && -n $BIND && -n $MAX_UPLOAD ]] \
+        || die "$CONFIG_FILE is incomplete; fix it or re-run 'install'."
+}
+
+# One-time migration for installs that predate .fs_config. Anything that cannot
+# be recovered is left empty for the caller to default, and reported.
+migrate_config_from_unit() {
+    local exec_line unit_user
+    exec_line=$(grep -m1 '^ExecStart=' "$SERVICE_FILE" 2>/dev/null || true)
+    [[ -n $exec_line ]] || return 1
+
+    local -a argv=()
+    read -r -a argv <<< "$exec_line"
+
+    local i=1 arg
+    while (( i < ${#argv[@]} )); do
+        arg=${argv[i]}
+        case $arg in
+            --port)       PORT=${argv[i+1]:-} ;            i=$(( i + 2 )) ;;
+            --dir)        SERVE_DIR=${argv[i+1]:-} ;       i=$(( i + 2 )) ;;
+            --bind)       BIND=${argv[i+1]:-} ;            i=$(( i + 2 )) ;;
+            --max-upload) MAX_UPLOAD=${argv[i+1]:-} ;      i=$(( i + 2 )) ;;
+            --allow-host) ALLOW_HOSTS+=("${argv[i+1]:-}"); i=$(( i + 2 )) ;;
+            *)            i=$(( i + 1 )) ;;
+        esac
+    done
+
+    # The unit renders this as "<MiB>m", so store the bare integer.
+    MAX_UPLOAD=${MAX_UPLOAD%[mMkKgG]}
+
+    # User= is authoritative for the service user, not anything in ExecStart.
+    unit_user=$(grep -m1 '^User=' "$SERVICE_FILE" 2>/dev/null | cut -d= -f2- || true)
+    if [[ -n $unit_user ]]; then
+        RUN_USER=$unit_user
+    fi
+
+    return 0
+}
+
+# ── health check ──────────────────────────────────────────────────────────────
+
+# 0.0.0.0 means "every IPv4 address", so probe loopback instead.
+health_target() {
+    case $BIND in
+        0.0.0.0) echo "127.0.0.1" ;;
+        ::|::0)  echo "[::1]" ;;
+        *:*)     echo "[$BIND]" ;;
+        *)       echo "$BIND" ;;
+    esac
+}
+
+# Type=simple returns from `systemctl restart` before the socket is bound, so a
+# single probe would race the bind and roll back good updates.
+wait_healthy() {
+    local target token i=0 tries=15
+    target=$(health_target)
+    token=$(cut -d= -f2- "$TOKEN_FILE" 2>/dev/null || true)
+
+    if ! command -v curl &>/dev/null; then
+        cyan "  curl not found — falling back to systemd state only."
+        while (( i < tries )); do
+            if systemctl is-active --quiet "$SERVICE_NAME"; then
+                return 0
+            fi
+            i=$(( i + 1 ))
+            sleep 1
+        done
+        return 1
+    fi
+
+    while (( i < tries )); do
+        # --fail matters: without it curl exits 0 on 401/403/500, which are
+        # exactly the failures this is meant to catch.
+        if systemctl is-active --quiet "$SERVICE_NAME" \
+           && curl --fail --silent --show-error --max-time 5 \
+                   -u ":${token}" "http://${target}:${PORT}/api/files" >/dev/null 2>&1; then
+            return 0
+        fi
+        i=$(( i + 1 ))
+        sleep 1
+    done
+    return 1
+}
+
+# True when version $1 is higher than version $2.
+version_gt() {
+    [[ $1 != "$2" ]] \
+        && [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
+}
+
+# ── install ───────────────────────────────────────────────────────────────────
+do_install() {
+    require_root
+
+    # install is the only verb that takes settings; update preserves them.
+    PORT=${PORT:-$DEFAULT_PORT}
+    SERVE_DIR=${SERVE_DIR:-$DEFAULT_DIR}
+    RUN_USER=${RUN_USER:-$DEFAULT_USER}
+    BIND=${BIND:-$DEFAULT_BIND}
+    MAX_UPLOAD=${MAX_UPLOAD:-$DEFAULT_MAX_UPLOAD}
+
+    # Re-running install regenerates the auth token, which breaks every client.
+    # Send that to 'update' instead, which exists precisely to avoid it.
+    if [[ -f $SERVICE_FILE && $FORCE -eq 0 ]]; then
+        die "'$SERVICE_NAME' is already installed. Use 'update' to apply this \
+version without rotating the auth token, or 'install --force' to reinstall from scratch."
+    fi
+
+    validate_config
+    prepare_unit_vars
+
+    # Validate / create run user
+    if ! id -u "$RUN_USER" &>/dev/null; then
+        cyan "Creating system user '$RUN_USER'..."
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER"
+    fi
+
+    # Create directories
+    cyan "Creating directories..."
+    mkdir -p "$INSTALL_DIR"
+    mkdir -p "$SERVE_DIR"
+    chown "$RUN_USER":"$RUN_USER" "$SERVE_DIR"
+    chmod 755 "$SERVE_DIR"
+
+    # ── auth token ────────────────────────────────────────────────────────────
+    if [[ -z "$TOKEN" ]]; then
+        if command -v openssl &>/dev/null; then
+            TOKEN=$(openssl rand -hex 24)
+        else
+            TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        fi
+    fi
+    printf 'FS_TOKEN=%s\n' "$TOKEN" > "$TOKEN_FILE"
+    chown root:root "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+
+    # ── write server + unit ───────────────────────────────────────────────────
+    # Same-directory temp then rename, so an interrupted run cannot leave a
+    # truncated serve.py or a half-written unit behind.
+    cyan "Writing server..."
+    local tmp_py="${INSTALL_DIR}/.serve.py.new"
+    write_serve_py "$tmp_py"
+    chmod +x "$tmp_py"
+    chown root:root "$tmp_py"
+    mv -f "$tmp_py" "$INSTALL_DIR/serve.py"
+
+    write_config
+
+    cyan "Creating systemd service..."
+    local tmp_unit="${SERVICE_FILE}.new"
+    render_unit "$tmp_unit"
+    chmod 644 "$tmp_unit"
+    chown root:root "$tmp_unit"
+    mv -f "$tmp_unit" "$SERVICE_FILE"
+
+    # ── enable + start ────────────────────────────────────────────────────────
+    cyan "Enabling and starting service..."
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME"
+
+    # Record the version only once the service is actually up, so a failed
+    # install cannot make a later `update` believe it is already current.
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        printf '%s\n' "$VERSION" > "$VERSION_FILE"
+        chmod 644 "$VERSION_FILE"
+    else
+        red "WARNING: $SERVICE_NAME is not active; version not recorded."
+        echo "         Check: journalctl -u $SERVICE_NAME -n 50 --no-pager"
+    fi
+
+    # ── done ──────────────────────────────────────────────────────────────────
+    echo
+    green "✓ fileserver installed and running (v$VERSION)."
+    echo
+    print_config
     bold "  Python script   : $INSTALL_DIR/serve.py"
     bold "  Service file    : $SERVICE_FILE"
+    bold "  Settings stored : $CONFIG_FILE"
     echo
     cyan "  Auth token      : $TOKEN"
     cyan "  Authenticate with: curl -u :$TOKEN http://<host>:${PORT}/"
@@ -953,13 +1201,232 @@ EOF
     echo "  Useful commands:"
     echo "    systemctl status  $SERVICE_NAME"
     echo "    journalctl -fu    $SERVICE_NAME"
-    echo "    systemctl restart $SERVICE_NAME"
+    echo "    sudo $0 status"
     echo "    sudo $0 uninstall"
+}
+
+# ── update ────────────────────────────────────────────────────────────────────
+do_update() {
+    require_root
+    command -v systemctl &>/dev/null || die "systemd is required for update."
+
+    if [[ -n $PORT || -n $SERVE_DIR || -n $RUN_USER || -n $BIND || -n $MAX_UPLOAD \
+          || ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+        die "update takes no settings — it keeps the deployed ones.
+       Change them by editing $CONFIG_FILE and re-running update."
+    fi
+
+    [[ -f $INSTALL_DIR/serve.py ]] || die "Not installed: $INSTALL_DIR/serve.py is missing. Run 'install' first."
+    [[ -f $SERVICE_FILE ]]         || die "Not installed: $SERVICE_FILE is missing. Run 'install' first."
+    [[ -f $TOKEN_FILE ]]           || die "Auth token $TOKEN_FILE is missing; refusing to touch a broken install."
+
+    # ── gather the deployed settings ─────────────────────────────────────────
+    if read_config; then
+        cyan "Settings read from $CONFIG_FILE"
+    else
+        cyan "No $CONFIG_FILE (installed before v1.1) — recovering from the unit"
+        PORT=""; SERVE_DIR=""; RUN_USER=""; BIND=""; MAX_UPLOAD=""; ALLOW_HOSTS=()
+        migrate_config_from_unit \
+            || die "Could not read ExecStart= from $SERVICE_FILE."
+        local fell_back=""
+        if [[ -z $PORT ]]; then       PORT=$DEFAULT_PORT;           fell_back+=" port"; fi
+        if [[ -z $SERVE_DIR ]]; then  SERVE_DIR=$DEFAULT_DIR;       fell_back+=" dir"; fi
+        if [[ -z $RUN_USER ]]; then   RUN_USER=$DEFAULT_USER;       fell_back+=" user"; fi
+        if [[ -z $BIND ]]; then       BIND=$DEFAULT_BIND;           fell_back+=" bind"; fi
+        if [[ -z $MAX_UPLOAD ]]; then MAX_UPLOAD=$DEFAULT_MAX_UPLOAD; fell_back+=" max-upload"; fi
+        if [[ -n $fell_back ]]; then
+            red "WARNING: not present in the unit, defaulting:${fell_back}"
+        fi
+    fi
+
+    validate_config
+    prepare_unit_vars
+
+    # ── version gate ─────────────────────────────────────────────────────────
+    local deployed=""
+    if [[ -f $VERSION_FILE ]]; then
+        deployed=$(tr -d '[:space:]' < "$VERSION_FILE")
+    fi
+
+    if [[ -z $deployed ]]; then
+        cyan "Deployed version unrecorded (installed before v1.1); proceeding."
+    elif [[ $deployed == "$VERSION" ]]; then
+        if [[ $FORCE -eq 0 ]]; then
+            green "✓ Already up to date (version $VERSION)."
+            echo  "  Use --force to re-apply anyway."
+            return 0
+        fi
+        cyan "Re-applying version $VERSION (--force)."
+    elif version_gt "$deployed" "$VERSION" && [[ $FORCE -eq 0 ]]; then
+        die "Deployed version $deployed is newer than this script ($VERSION).
+       Refusing to downgrade; pass --force if that is really what you want."
+    fi
+
+    # ── dry run ──────────────────────────────────────────────────────────────
+    if [[ $DRY_RUN -eq 1 ]]; then
+        bold "Dry run — nothing will be changed."
+        echo
+        print_config
+        echo
+        echo  "  Deployed version : ${deployed:-<unrecorded>}"
+        echo  "  Script version   : $VERSION"
+        echo
+        echo  "  Would back up   $INSTALL_DIR/serve.py and $SERVICE_FILE"
+        echo  "                  to $BACKUP_DIR/"
+        echo  "  Would rewrite   both from this script (v$VERSION)"
+        echo  "  Would restart   $SERVICE_NAME and verify it answers /api/files"
+        echo  "  Token           $TOKEN_FILE left untouched"
+        return 0
+    fi
+
+    # ── back up ──────────────────────────────────────────────────────────────
+    # Not under $SERVE_DIR: that is ReadWritePaths= and owned by the service
+    # user, which would let the server read or tamper with its own rollback.
+    local stamp backup
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="$BACKUP_DIR/${deployed:-unknown}-$stamp"
+    mkdir -p "$backup"
+    cp -p "$INSTALL_DIR/serve.py" "$backup/serve.py"
+    cp -p "$SERVICE_FILE"         "$backup/${SERVICE_NAME}.service"
+    printf '%s\n' "${deployed:-unknown}" > "$backup/version"
+    chmod -R go-rwx "$BACKUP_DIR"
+    cyan "Backed up to $backup"
+
+    # Warn about unit directives we do not manage, so a hand-tuned setting is
+    # not reverted silently. It stays recoverable from the backup either way.
+    local extra
+    extra=$(grep -vE '^(#|$|\[Unit\]|\[Service\]|\[Install\]|Description=|After=|Type=|User=|Group=|EnvironmentFile=|ExecStart=|Restart=|RestartSec=|PrivateTmp=|NoNewPrivileges=|ProtectSystem=|ProtectHome=|PrivateDevices=|ProtectKernelTunables=|ProtectKernelModules=|ProtectControlGroups=|RestrictNamespaces=|RestrictRealtime=|RestrictAddressFamilies=|LockPersonality=|ReadWritePaths=|MemoryMax=|TasksMax=|WantedBy=)' "$SERVICE_FILE" || true)
+    if [[ -n $extra ]]; then
+        red "WARNING: $SERVICE_FILE has directives this version does not manage:"
+        printf '%s\n' "$extra" | sed 's/^/    /'
+        echo "  They are in the backup but will not be in the regenerated unit."
+    fi
+
+    # ── apply ────────────────────────────────────────────────────────────────
+    # The service user and serve directory may have been removed since install.
+    if ! id -u "$RUN_USER" &>/dev/null; then
+        cyan "Re-creating system user '$RUN_USER'..."
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER"
+    fi
+    mkdir -p "$SERVE_DIR"
+    chown "$RUN_USER":"$RUN_USER" "$SERVE_DIR"
+
+    cyan "Writing server v$VERSION..."
+    local tmp_py="${INSTALL_DIR}/.serve.py.new"
+    write_serve_py "$tmp_py"
+    chmod +x "$tmp_py"
+    chown root:root "$tmp_py"
+    mv -f "$tmp_py" "$INSTALL_DIR/serve.py"
+
+    write_config
+
+    local tmp_unit="${SERVICE_FILE}.new"
+    render_unit "$tmp_unit"
+    chmod 644 "$tmp_unit"
+    chown root:root "$tmp_unit"
+    mv -f "$tmp_unit" "$SERVICE_FILE"
+
+    cyan "Restarting $SERVICE_NAME..."
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE_NAME" || true
+
+    # ── verify, or roll back ─────────────────────────────────────────────────
+    if wait_healthy; then
+        # Stamped last: a crash before this point must not leave a version
+        # recorded that would make the next update a no-op on a broken deploy.
+        printf '%s\n' "$VERSION" > "$VERSION_FILE"
+        chmod 644 "$VERSION_FILE"
+        echo
+        green "✓ Updated to v$VERSION (was ${deployed:-unrecorded})."
+        echo "  Auth token unchanged; clients keep working."
+        echo "  Backup: $backup"
+        return 0
+    fi
+
+    red "✗ v$VERSION did not come up healthy. Rolling back..."
+    cp -p "$backup/serve.py" "$INSTALL_DIR/serve.py"
+    cp -p "$backup/${SERVICE_NAME}.service" "$SERVICE_FILE"
+    systemctl daemon-reload || true
+    systemctl restart "$SERVICE_NAME" || true
+    echo
+    red  "Rolled back to ${deployed:-the previous version}."
+    echo "  Backup kept at: $backup"
+    echo "  Logs:           journalctl -u $SERVICE_NAME -n 50 --no-pager"
+    exit 1
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+do_status() {
+    require_root
+    bold "fileserver status"
+    echo
+
+    local deployed=""
+    if [[ -f $VERSION_FILE ]]; then
+        deployed=$(tr -d '[:space:]' < "$VERSION_FILE")
+    fi
+
+    echo "  Script version  : $VERSION"
+    if [[ -z $deployed ]]; then
+        red "  Deployed version: unrecorded (installed before v1.1)"
+    elif [[ $deployed == "$VERSION" ]]; then
+        green "  Deployed version: $deployed (up to date)"
+    elif version_gt "$deployed" "$VERSION"; then
+        cyan "  Deployed version: $deployed (newer than this script)"
+    else
+        cyan "  Deployed version: $deployed (update available)"
+    fi
+    echo
+
+    if command -v systemctl &>/dev/null; then
+        local active enabled
+        active=$(systemctl is-active  "$SERVICE_NAME" 2>/dev/null || true)
+        enabled=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)
+        echo "  Service         : ${active:-unknown} / ${enabled:-unknown}"
+    fi
+    if [[ -f $INSTALL_DIR/serve.py ]]; then
+        echo "  Server script   : $INSTALL_DIR/serve.py"
+    else
+        red "  Server script   : MISSING ($INSTALL_DIR/serve.py)"
+    fi
+    if [[ -f $SERVICE_FILE ]]; then
+        echo "  Unit file       : $SERVICE_FILE"
+    else
+        red "  Unit file       : MISSING ($SERVICE_FILE)"
+    fi
+
+    # Never print the token itself — only whether it is there and who can read it.
+    if [[ -f $TOKEN_FILE ]]; then
+        echo "  Auth token      : set, $(stat -c '%U:%G %a' "$TOKEN_FILE" 2>/dev/null || echo 'perms unknown') (value not shown)"
+    else
+        red "  Auth token      : MISSING — the service cannot start without it"
+    fi
+    echo
+
+    if read_config; then
+        echo "  Settings from $CONFIG_FILE:"
+        print_config
+    else
+        echo "  Settings        : $CONFIG_FILE not found (run 'update' to migrate)"
+    fi
+
+    local latest=""
+    if [[ -d $BACKUP_DIR ]]; then
+        latest=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d \
+                     -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2- || true)
+    fi
+    if [[ -n $latest ]]; then
+        echo
+        echo "  Latest backup   : ${latest%/}"
+    fi
 }
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
 case "$CMD" in
     install)   do_install   ;;
+    update)    do_update    ;;
+    status)    do_status    ;;
     uninstall) do_uninstall ;;
     *)         usage        ;;
 esac

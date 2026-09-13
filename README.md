@@ -33,6 +33,53 @@ sudo ./fileserver-install.sh uninstall
 
 no dependencies beyond python3 and systemd.
 
+## updating
+
+`update` applies the server and systemd unit built into the script you are
+running, keeping your settings and your auth token.
+
+```sh
+# 1. fetch the newer script
+curl -fsSL https://raw.githubusercontent.com/retro1878/uHTTP/main/fileserver-install.sh -o fileserver-install.sh
+```
+
+```sh
+# 2. apply it
+sudo ./fileserver-install.sh update
+```
+
+the script does no network i/o of its own — you only ever run a script you
+fetched yourself.
+
+your port, directory, service user, bind address, upload limit and allowed hosts
+are read back from `/opt/fileserver/.fs_config`, so an update never alters them,
+and the token is left untouched, so connected clients keep working. re-running
+`install` on a live box is refused for exactly that reason — it generates a new
+token. installs from before v1.1 have no `.fs_config`; the first `update`
+recovers the settings from the existing unit and writes that file.
+
+if the service does not come back healthy, the previous server and unit are
+restored automatically and the update exits non-zero.
+
+```sh
+# version, settings and service state
+sudo ./fileserver-install.sh status
+```
+
+```sh
+# show what an update would change, and change nothing
+sudo ./fileserver-install.sh update --dry-run
+```
+
+```sh
+# re-apply, or override a downgrade refusal
+sudo ./fileserver-install.sh update --force
+```
+
+to change a setting, edit `/opt/fileserver/.fs_config` (root-only) and re-run
+`update`. each update keeps a timestamped copy of the previous server and unit
+under `/opt/fileserver/backups/`.
+
 ## web ui
 
 `http://<host>:8080/` serves the browse/upload page — a table of files with size,

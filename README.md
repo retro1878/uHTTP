@@ -58,6 +58,12 @@ and the token is left untouched, so connected clients keep working. re-running
 token. installs from before v1.1 have no `.fs_config`; the first `update`
 recovers the settings from the existing unit and writes that file.
 
+installs from before authentication was added have no token file at all. the
+server refuses to start without one, so `update` declines those until you pass
+`--init-token`, which generates a token — after which every client must
+authenticate. those installs also listened on every interface (their unit had no
+`--bind`), so that is preserved rather than quietly narrowed to localhost.
+
 if the service does not come back healthy, the previous server and unit are
 restored automatically and the update exits non-zero.
 
@@ -74,6 +80,11 @@ sudo bash fileserver-install.sh update --dry-run
 ```sh
 # re-apply, or override a downgrade refusal
 sudo bash fileserver-install.sh update --force
+```
+
+```sh
+# an install from before authentication: generate a token, then apply
+sudo bash fileserver-install.sh update --init-token
 ```
 
 to change a setting, edit `/opt/fileserver/.fs_config` (root-only) and re-run

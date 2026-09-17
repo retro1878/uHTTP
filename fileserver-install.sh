@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -373,15 +373,20 @@ tbody td{padding:9px 8px;vertical-align:middle}
 }
 .dl-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim)}
 
-/* row actions: the delete button sits beside the download button */
+/* row actions: copy and delete sit beside the download button */
 .row-actions{float:right;display:flex;gap:6px;align-items:center}
-.row-actions .dl-btn{float:none}
-.rm-btn{
+/* Three controls take more width than the column is always given. A squeezed
+   table shrinks flex items by default, which wraps each label onto two lines;
+   keeping them rigid moves that into the horizontal scroll the page already has. */
+.row-actions .dl-btn{float:none;white-space:nowrap;flex:0 0 auto}
+.cp-btn,.rm-btn{
   background:none;border:1px solid var(--border);
   color:var(--muted2);padding:4px 10px;border-radius:2px;
   cursor:pointer;font-family:var(--font);font-size:11px;font-weight:500;
+  white-space:nowrap;flex:0 0 auto;
   transition:all .15s;letter-spacing:.04em
 }
+.cp-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim)}
 .rm-btn:hover{border-color:var(--red);color:var(--red);background:var(--red-dim)}
 
 .empty{text-align:center;padding:48px;color:var(--muted2);font-size:12px}
@@ -453,6 +458,10 @@ tbody td{padding:9px 8px;vertical-align:middle}
 <script>
 const $ = id => document.getElementById(id);
 
+// Filled in by the server. Only a client that already authenticated can read
+// this page, so this discloses nothing to anyone who did not already have it.
+const TOKEN = __FS_TOKEN__;
+
 function fmtSize(b) {
   if (!b) return '0 B';
   const u = ['B','KB','MB','GB','TB'];
@@ -514,6 +523,7 @@ async function load() {
         + '<td><span class="flast">'+fmtAge(f.last_download)+'</span></td>'
         + '<td><div class="row-actions">'
         +   '<a class="dl-btn" href="/dl/'+encodeURIComponent(f.name)+'">&#8595; download</a>'
+        +   '<button class="cp-btn" data-name="'+esc(f.name)+'" title="copy a wget command for this file">wget</button>'
         +   '<button class="rm-btn" data-name="'+esc(f.name)+'">&#10005; delete</button>'
         + '</div></td>'
         + '</tr>';
@@ -536,9 +546,63 @@ async function del(name) {
   }
 }
 
-$('tbody').addEventListener('click', e => {
-  const b = e.target.closest ? e.target.closest('.rm-btn') : null;
-  if (b) del(b.dataset.name);
+// ── copy a wget command ───────────────────────────────────────────────────────
+// --token lets an operator pick a password containing shell metacharacters, so
+// it has to be quoted rather than pasted in raw. Single-quoting makes everything
+// inside literal, and a quote in the value is spelled by closing, escaping and
+// reopening. The backslash is built from a char code because this page is
+// written through a Python string in the installer, where a typed one is an
+// escape of its own and yields wrong quoting rather than a visible error.
+const SQ = "'", BS = String.fromCharCode(92);
+
+function shellQuote(s) {
+  return SQ + s.split(SQ).join(SQ + BS + SQ + SQ) + SQ;
+}
+
+function wgetCmd(name) {
+  // The URL comes from location.origin, so the command fits whatever address
+  // this page was actually reached by.
+  const auth = TOKEN ? ' --user=u --password=' + shellQuote(TOKEN) : '';
+  return 'wget' + auth + ' ' + location.origin + '/dl/' + encodeURIComponent(name);
+}
+
+async function copyText(text) {
+  // navigator.clipboard needs a secure context, and this server speaks plain
+  // http on an address that is usually not localhost, so the old execCommand
+  // path is the one that normally runs.
+  try {
+    if (window.isSecureContext && navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch(e) { /* fall through to the textarea below */ }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '-1000px';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch(e) { ok = false; }
+  document.body.removeChild(ta);
+  return ok;
+}
+
+$('tbody').addEventListener('click', async e => {
+  const t = e.target;
+  const rm = t.closest && t.closest('.rm-btn');
+  if (rm) { del(rm.dataset.name); return; }
+  const cp = t.closest && t.closest('.cp-btn');
+  if (!cp) return;
+  const cmd = wgetCmd(cp.dataset.name);
+  if (await copyText(cmd)) {
+    toast('wget command copied');
+  } else {
+    // Nothing reached the clipboard, so show it instead: a dialog can be
+    // selected and copied by hand, a toast cannot.
+    window.prompt('copy this command:', cmd);
+  }
 });
 
 // ── upload ────────────────────────────────────────────────────────────────────
@@ -745,8 +809,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
+    def _token_literal(self):
+        """The token as a JS literal, safe inside a <script> block."""
+        if self.token is None:      # only reachable with --no-auth
+            return '""'
+        # json.dumps escapes quotes and backslashes; the '<' escape additionally
+        # stops a token containing "</script>" from ending the script block.
+        return json.dumps(self.token).replace("<", "\\u003c")
+
     def _serve_html(self):
-        body = HTML.encode()
+        body = HTML.replace("__FS_TOKEN__", self._token_literal()).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("X-Content-Type-Options", "nosniff")

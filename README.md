@@ -97,6 +97,19 @@ under `/opt/fileserver/backups/`.
 download count and last-download time, plus click-or-drag upload. every route is
 behind the token, so the browser asks for credentials before the page loads.
 
+each row also has a **wget** button that copies a ready-to-paste command for
+that file, credentials included:
+
+```sh
+wget --user=u --password='<the token>' http://<host>:8080/dl/<file>
+```
+
+the host is whichever address you loaded the page from, so the command fits the
+way you actually reach the server. the page is behind the token, so this tells
+an already-authenticated client nothing it did not already have — but the
+command is a credential: it lands in shell history on whatever machine you run
+it on, and it carries delete rights.
+
 each row has a **delete** button beside its download link. it asks for
 confirmation, then removes the file and its per-file download counters. the
 browse page is the only thing that lists files, so anything it does not show —

@@ -5,6 +5,7 @@
 #   sudo bash fileserver-install.sh install [--port PORT] [--dir DIR] [--user USER]
 #                                           [--bind ADDR] [--token TOKEN]
 #                                           [--allow-host HOST]... [--max-upload MiB]
+#                                           [--public-download]
 #   sudo bash fileserver-install.sh update  [--force] [--dry-run] [--init-token]
 #   sudo bash fileserver-install.sh status
 #   sudo bash fileserver-install.sh uninstall
@@ -16,7 +17,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -50,6 +51,7 @@ usage() {
     echo "  sudo bash $0 install   [--port PORT] [--dir DIR] [--user USER]"
     echo "                         [--bind ADDR] [--token TOKEN]"
     echo "                         [--allow-host HOST]... [--max-upload MiB]"
+    echo "                         [--public-download]"
     echo "  sudo bash $0 update    [--force] [--dry-run] [--init-token]"
     echo "  sudo bash $0 status"
     echo "  sudo bash $0 uninstall"
@@ -73,6 +75,10 @@ usage() {
     echo "                      e.g. --allow-host files.example.com"
     echo "                      Requests arriving with any other non-IP Host are"
     echo "                      rejected, which blocks DNS-rebinding attacks."
+    echo
+    echo "  --public-download   let anyone fetch /dl/<file> without the token, so an"
+    echo "                      install command can be published as-is. The listing,"
+    echo "                      uploads and deletes still require authentication."
     exit 0
 }
 
@@ -93,6 +99,7 @@ ALLOW_HOSTS=()
 FORCE=0
 DRY_RUN=0
 INIT_TOKEN=0
+PUBLIC_DOWNLOAD=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -110,6 +117,7 @@ while [[ $# -gt 0 ]]; do
         --force)      FORCE=1;          shift ;;
         --dry-run)    DRY_RUN=1;        shift ;;
         --init-token) INIT_TOKEN=1;     shift ;;
+        --public-download) PUBLIC_DOWNLOAD=1; shift ;;
         -h|--help) usage ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -178,6 +186,11 @@ prepare_unit_vars() {
             || die "Invalid --allow-host: $h"
         ALLOW_HOST_ARGS+=" --allow-host $h"
     done
+
+    PUBLIC_DL_ARG=""
+    if (( PUBLIC_DOWNLOAD )); then
+        PUBLIC_DL_ARG=" --public-download"
+    fi
 
     # The server holds the request body and its parsed copy in memory at once,
     # so give systemd a ceiling a few times above the configured upload cap.
@@ -458,8 +471,9 @@ tbody td{padding:9px 8px;vertical-align:middle}
 <script>
 const $ = id => document.getElementById(id);
 
-// Filled in by the server. Only a client that already authenticated can read
-// this page, so this discloses nothing to anyone who did not already have it.
+// The credential a copied download command needs, filled in by the server. It is
+// empty under --public-download, where the command needs none. Either way the page
+// itself sits behind the token, so this tells an unauthenticated client nothing.
 const TOKEN = __FS_TOKEN__;
 
 function fmtSize(b) {
@@ -656,6 +670,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     token = None
     allowed_hosts = frozenset()
     max_upload = MAX_UPLOAD_BYTES
+    public_download = False
     timeout = SOCKET_TIMEOUT
     _auth_failures = {}
     _auth_lock = threading.Lock()
@@ -774,9 +789,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._guard_request():
             return
-        if not self._require_auth():
-            return
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        # --public-download is what makes a link publishable: the file itself is
+        # readable by anyone, while the listing that names the files, the API and
+        # every write still need the token. Deliberately GET-only and /dl/-only.
+        if not (self.public_download and path.startswith("/dl/")):
+            if not self._require_auth():
+                return
         if path == "/":
             self._serve_html()
         elif path == "/api/files":
@@ -810,8 +829,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def _token_literal(self):
-        """The token as a JS literal, safe inside a <script> block."""
-        if self.token is None:      # only reachable with --no-auth
+        """The value the page puts in a copied download command, as a JS literal."""
+        # Public downloads need no credentials, so the page is handed an empty
+        # one and the command it copies is safe to paste anywhere.
+        if self.token is None or self.public_download:
             return '""'
         # json.dumps escapes quotes and backslashes; the '<' escape additionally
         # stops a token containing "</script>" from ending the script block.
@@ -1004,6 +1025,9 @@ def main():
                         metavar="SIZE", help="maximum upload size, e.g. 512m or 1g")
     parser.add_argument("--no-auth", action="store_true",
                         help="disable authentication entirely (not recommended)")
+    parser.add_argument("--public-download", action="store_true",
+                        help="serve GET /dl/<file> without authentication, so a "
+                             "download link can be shared as-is")
     args = parser.parse_args()
 
     serve_dir = os.path.abspath(args.dir)
@@ -1030,6 +1054,7 @@ def main():
     Handler.token = token
     Handler.allowed_hosts = frozenset(allowed)
     Handler.max_upload = args.max_upload
+    Handler.public_download = args.public_download
     server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
 
     print(f"Serving : {serve_dir}")
@@ -1038,6 +1063,8 @@ def main():
     print("Hosts   : " + ", ".join(sorted(allowed)) + " (and any bare IP)")
     if token is None:
         print("Auth    : DISABLED via --no-auth")
+    elif args.public_download:
+        print("Auth    : enabled (HTTP Basic); /dl/ is open to anyone")
     else:
         print("Auth    : enabled (HTTP Basic)")
 
@@ -1067,7 +1094,7 @@ User=${RUN_USER}
 Group=${RUN_USER}
 # No leading '-' : the service must refuse to start without its token.
 EnvironmentFile=${INSTALL_DIR}/.fs_token
-ExecStart=/usr/bin/python3 ${INSTALL_DIR}/serve.py --port ${PORT} --dir ${SERVE_DIR} --bind ${BIND} --max-upload ${MAX_UPLOAD}m${ALLOW_HOST_ARGS}
+ExecStart=/usr/bin/python3 ${INSTALL_DIR}/serve.py --port ${PORT} --dir ${SERVE_DIR} --bind ${BIND} --max-upload ${MAX_UPLOAD}m${ALLOW_HOST_ARGS}${PUBLIC_DL_ARG}
 Restart=on-failure
 RestartSec=5
 # Hardening
@@ -1099,6 +1126,9 @@ print_config() {
     bold "  Service user    : $RUN_USER"
     bold "  Max upload      : ${MAX_UPLOAD} MiB"
     bold "  Extra hosts     : ${ALLOW_HOSTS[*]:-<none>}"
+    local publ="no"
+    if (( PUBLIC_DOWNLOAD )); then publ="yes (token not needed)"; fi
+    bold "  Public /dl/     : $publ"
 }
 
 # ── config persistence ────────────────────────────────────────────────────────
@@ -1116,6 +1146,7 @@ write_config() {
         printf 'BIND=%s\n'        "$BIND"
         printf 'MAX_UPLOAD=%s\n'  "$MAX_UPLOAD"
         printf 'ALLOW_HOSTS=%s\n' "${ALLOW_HOSTS[*]:-}"
+        printf 'PUBLIC_DOWNLOAD=%s\n' "$PUBLIC_DOWNLOAD"
     } > "$tmp"
     chown root:root "$tmp"
     chmod 600 "$tmp"
@@ -1135,6 +1166,7 @@ read_config() {
         || die "$CONFIG_FILE must be root-owned mode 600 (found ${owner}:${mode}); refusing to read it."
 
     PORT=""; SERVE_DIR=""; RUN_USER=""; BIND=""; MAX_UPLOAD=""; ALLOW_HOSTS=()
+    PUBLIC_DOWNLOAD=0
 
     local line key value
     while IFS= read -r line || [[ -n $line ]]; do
@@ -1154,6 +1186,14 @@ read_config() {
                 if [[ -n $value ]]; then
                     read -r -a ALLOW_HOSTS <<< "$value"
                 fi
+                ;;
+            PUBLIC_DOWNLOAD)
+                # Normalised here so nothing but 0 or 1 can ever reach the unit.
+                case $value in
+                    1|yes|true)     PUBLIC_DOWNLOAD=1 ;;
+                    0|no|false|"")  PUBLIC_DOWNLOAD=0 ;;
+                    *) die "$CONFIG_FILE: PUBLIC_DOWNLOAD must be 0 or 1 (got '$value')" ;;
+                esac
                 ;;
             *) die "$CONFIG_FILE: unexpected key '$key'" ;;
         esac
@@ -1182,6 +1222,7 @@ migrate_config_from_unit() {
             --bind)       BIND=${argv[i+1]:-} ;            i=$(( i + 2 )) ;;
             --max-upload) MAX_UPLOAD=${argv[i+1]:-} ;      i=$(( i + 2 )) ;;
             --allow-host) ALLOW_HOSTS+=("${argv[i+1]:-}"); i=$(( i + 2 )) ;;
+            --public-download) PUBLIC_DOWNLOAD=1;          i=$(( i + 1 )) ;;
             *)            i=$(( i + 1 )) ;;
         esac
     done
@@ -1383,7 +1424,7 @@ do_update() {
     command -v systemctl &>/dev/null || die "systemd is required for update."
 
     if [[ -n $PORT || -n $SERVE_DIR || -n $RUN_USER || -n $BIND || -n $MAX_UPLOAD \
-          || -n $TOKEN || ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+          || -n $TOKEN || ${#ALLOW_HOSTS[@]} -gt 0 || $PUBLIC_DOWNLOAD -ne 0 ]]; then
         die "update takes no settings — it keeps the deployed ones.
        Change them by editing $CONFIG_FILE and re-running update."
     fi

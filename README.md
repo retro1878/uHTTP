@@ -27,6 +27,11 @@ sudo bash fileserver-install.sh install --bind 192.168.1.5 --max-upload 2048
 ```
 
 ```sh
+# publish download links that work without the token (see "public downloads")
+sudo bash fileserver-install.sh install --bind 0.0.0.0 --public-download
+```
+
+```sh
 # remove service and install dir (leaves your files intact)
 sudo bash fileserver-install.sh uninstall
 ```
@@ -108,7 +113,9 @@ the host is whichever address you loaded the page from, so the command fits the
 way you actually reach the server. the page is behind the token, so this tells
 an already-authenticated client nothing it did not already have — but the
 command is a credential: it lands in shell history on whatever machine you run
-it on, and it carries delete rights.
+it on, and it carries delete rights. run the server with `--public-download` and
+the button copies the command with no credentials in it at all (see below),
+which is what makes it safe to paste into a channel.
 
 each row has a **delete** button beside its download link. it asks for
 confirmation, then removes the file and its per-file download counters. the
@@ -120,9 +127,10 @@ are a record of what has been served, not of what is currently on disk.
 ## auth
 
 the installer generates a random token on install (or use `--token`) and prints it at the end.
-all routes require http basic auth — the password is the token, the username is ignored. that
-includes deleting, so the token is a full read/write credential: give it only to people who
-should be able to remove files.
+every route requires http basic auth — the password is the token, the username is ignored —
+except `GET /dl/<file>` when installed with `--public-download` (see below). that includes
+deleting, so the token is a full read/write credential: give it only to people who should be
+able to remove files.
 
 ```sh
 curl -u :TOKEN http://localhost:8080/api/files
@@ -133,6 +141,30 @@ the browser prompts for a username/password the first time — enter anything as
 if the token file is missing the service refuses to start rather than coming up
 without authentication. running `serve.py` by hand needs `--token`, `FS_TOKEN`,
 or an explicit `--no-auth`.
+
+## open downloads
+
+`--public-download` answers `GET /dl/<file>` without credentials, so a download
+link can be published as it stands:
+
+```sh
+curl -fsSL http://<host>:8080/dl/<file> -o /tmp/<file>
+```
+
+nothing else opens with it. the browse page, the API, uploads and deletes all
+still require the token, and an unauthenticated request to any of them is refused
+with the same `401` whether or not the path exists — so it does not even confirm
+which files are there. the `Host` allow-list and the cross-site checks apply to
+`/dl/` exactly as they do elsewhere.
+
+the wget button follows the setting: while downloads are open it copies a command
+carrying no credentials, which is what makes that command safe to paste somewhere
+public. the token is not a read-only credential — it deletes — so the difference
+between the two buttons is the whole point.
+
+set it at install, or put `PUBLIC_DOWNLOAD=1` in `/opt/fileserver/.fs_config` and
+re-run `update` on an existing install. `update` itself refuses the flag, the same
+way it refuses every other setting.
 
 ## network exposure
 

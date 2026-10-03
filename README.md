@@ -102,6 +102,11 @@ under `/opt/fileserver/backups/`.
 download count and last-download time, plus click-or-drag upload. every route is
 behind the token, so the browser asks for credentials before the page loads.
 
+an upload never replaces a file that is already there. if the name is taken the
+incoming file is kept alongside it as `name(0).ext`, `name(1).ext` and so on, the
+same thing a browser does when you select several files sharing a name. delete a
+file from the table first if you meant to replace it.
+
 each row also has a **wget** button that copies a ready-to-paste command for
 that file, credentials included:
 

@@ -18,7 +18,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.5.3"
+VERSION="1.5.4"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -860,7 +860,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _api_files(self):
-        stats = load_stats(self.serve_dir)
+        # Same lock record_download() writes it under. Reading unlocked could
+        # catch save_stats() mid-write — it truncates the file and rewrites it —
+        # and a partial read falls back to empty counters, blanking the table.
+        # Held only for the read: scanning the directory under it would queue
+        # downloads behind the scan.
+        with _stats_lock:
+            stats = load_stats(self.serve_dir)
         files = []
         try:
             for entry in sorted(os.scandir(self.serve_dir), key=lambda e: e.name.lower()):
@@ -883,7 +889,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"files": files})
 
     def _api_stats(self):
-        stats = load_stats(self.serve_dir)
+        with _stats_lock:
+            stats = load_stats(self.serve_dir)
         self.send_json({
             "total_downloads": stats.get("total_downloads", 0),
             "total_bytes":     stats.get("total_bytes", 0),

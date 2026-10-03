@@ -214,3 +214,10 @@ is accepted, and keep `--bind` on `127.0.0.1`.
 `--max-upload` (default 512 MiB) caps a single upload, and the installer sizes the
 systemd `MemoryMax` ceiling to match. connections that stall for 60 seconds are
 dropped.
+
+download counts live in `.fs_stats.json` in the serve directory, rewritten in
+full on every download under a lock that the listing endpoints also take, so a
+page load during heavy traffic sees consistent counters. that file is rewritten
+rather than appended to, so with a large number of served files the per-download
+cost grows with the number of counters — fine for hundreds of files, worth
+replacing with sqlite if it ever runs to tens of thousands.

@@ -7,6 +7,7 @@
 #                                           [--allow-host HOST]... [--max-upload MiB]
 #                                           [--public-download]
 #   sudo bash fileserver-install.sh update  [--force] [--dry-run] [--init-token]
+#   sudo bash fileserver-install.sh update  [--force] [--dry-run] [--init-token]
 #   sudo bash fileserver-install.sh status
 #   sudo bash fileserver-install.sh uninstall
 #
@@ -17,7 +18,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -221,7 +222,6 @@ import mimetypes
 import os
 import re
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -995,12 +995,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 filename = os.path.basename(filename)
                 if not filename or filename.startswith("."):
                     continue
-                target = os.path.join(self.serve_dir, filename)
-                fd, tmp = tempfile.mkstemp(dir=self.serve_dir, prefix=".upload-", suffix=".tmp")
+                base, ext = os.path.splitext(filename)
+                # Never clobber. os.replace() would overwrite silently, so anyone
+                # who could name an existing file could destroy it — and these
+                # are the files being served. Take the free name and keep both:
+                # second(0).txt, second(1).txt, ... The first free index wins, so
+                # a gap left by deleting one is reused rather than skipped.
+                target = None
+                for n in range(0, 1000):
+                    try:
+                        name = f"{base}({n}){ext}"
+                        fd = os.open(os.path.join(self.serve_dir, name),
+                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                        target = name
+                        break
+                    except FileExistsError:
+                        continue
+                    except OSError as e:
+                        self.send_json({"error": f"Upload failed: {e.strerror}"}, 400)
+                        return
+                if target is None:
+                    self.send_json({"error": "Too many files of that name already exist"}, 400)
+                    return
                 with os.fdopen(fd, "wb") as f:
                     f.write(data)
-                os.replace(tmp, target)
-                saved.append(filename)
+                saved.append(target)
         except Exception as e:
             self.log_error("upload failed: %s", e)
             self.send_json({"error": "Upload failed."}, 400)

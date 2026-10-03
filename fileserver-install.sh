@@ -18,7 +18,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -756,17 +756,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._auth_failures[ip] = recent
             return len(recent)
 
+    def _clear_auth_failures(self, ip):
+        with self._auth_lock:
+            self._auth_failures.pop(ip, None)
+
     def _record_auth_failure(self, ip):
         with self._auth_lock:
             self._auth_failures.setdefault(ip, []).append(time.time())
 
     def _require_auth(self):
         ip = self.client_address[0]
+        # Check the credential before the lockout, not after: a valid token is
+        # never the thing being rate-limited, so it must never be refused. This
+        # also stops a bad guess from locking out a valid client that shares the
+        # address — which is every client behind one NAT, and a random
+        # scraper is enough to do it.
+        if self._check_auth():
+            self._clear_auth_failures(ip)
+            return True
         if self._auth_failures_for(ip) >= AUTH_MAX_FAILURES:
             self.send_json({"error": "Too many failed attempts. Try again later."}, 429)
             return False
-        if self._check_auth():
-            return True
         self._record_auth_failure(ip)
         body = json.dumps({"error": "Unauthorized"}).encode()
         self.send_response(401)

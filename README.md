@@ -143,6 +143,12 @@ curl -u :TOKEN http://localhost:8080/api/files
 
 the browser prompts for a username/password the first time — enter anything as the username and the token as the password.
 
+five wrong attempts from one address earn a `429` for the next minute. that only
+ever refuses guesses: a request carrying the correct token is answered normally
+however many failures that address has accumulated, and a success clears the
+counter. an attacker therefore cannot lock the owner out from behind a shared
+address, nor wedge a valid client.
+
 if the token file is missing the service refuses to start rather than coming up
 without authentication. running `serve.py` by hand needs `--token`, `FS_TOKEN`,
 or an explicit `--no-auth`.

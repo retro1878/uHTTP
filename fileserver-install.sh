@@ -18,7 +18,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.5.2"
+VERSION="1.5.3"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -1008,13 +1008,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 base, ext = os.path.splitext(filename)
                 # Never clobber. os.replace() would overwrite silently, so anyone
                 # who could name an existing file could destroy it — and these
-                # are the files being served. Take the free name and keep both:
-                # second(0).txt, second(1).txt, ... The first free index wins, so
-                # a gap left by deleting one is reused rather than skipped.
+                # are the files being served. Take the name as given; only on a
+                # real collision fall back to second(1).txt, second(2).txt, ...
+                # A first upload must keep the plain name, so try that before
+                # any suffix. The first free index wins, so a gap left by
+                # deleting one is reused rather than skipped.
                 target = None
-                for n in range(0, 1000):
+                for name in [filename] + [f"{base}({n}){ext}" for n in range(1, 1000)]:
                     try:
-                        name = f"{base}({n}){ext}"
                         fd = os.open(os.path.join(self.serve_dir, name),
                                      os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
                         target = name

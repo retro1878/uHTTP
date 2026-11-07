@@ -7,7 +7,6 @@
 #                                           [--allow-host HOST]... [--max-upload MiB]
 #                                           [--public-download]
 #   sudo bash fileserver-install.sh update  [--force] [--dry-run] [--init-token]
-#   sudo bash fileserver-install.sh update  [--force] [--dry-run] [--init-token]
 #   sudo bash fileserver-install.sh status
 #   sudo bash fileserver-install.sh uninstall
 #
@@ -18,7 +17,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-VERSION="1.5.4"
+VERSION="1.5.5"
 
 INSTALL_DIR="/opt/fileserver"
 SERVICE_NAME="fileserver"
@@ -53,7 +52,7 @@ usage() {
     echo "                         [--bind ADDR] [--token TOKEN]"
     echo "                         [--allow-host HOST]... [--max-upload MiB]"
     echo "                         [--public-download]"
-    echo "  sudo bash $0 update    [--force] [--dry-run] [--init-token]"
+    echo "  sudo bash $0 update    [--force] [--dry-run] [--init-token]  (or: upgrade)"
     echo "  sudo bash $0 status"
     echo "  sudo bash $0 uninstall"
     echo
@@ -166,6 +165,12 @@ validate_config() {
     case $SERVE_DIR in
         *[$'\n\r\t']*|*' '*) die "--dir must not contain whitespace: $SERVE_DIR" ;;
     esac
+    if [[ $SERVE_DIR == "$INSTALL_DIR" || $SERVE_DIR == "$INSTALL_DIR"/* ]]; then
+        die "--dir cannot be inside $INSTALL_DIR"
+    fi
+    if [[ $SERVE_DIR == "/" ]]; then
+        die "--dir cannot be root directory (/)"
+    fi
     [[ $BIND =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $BIND =~ ^[0-9a-fA-F:]+$ ]] \
         || die "Invalid bind address: $BIND"
     [[ $RUN_USER =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Invalid user name: $RUN_USER"
@@ -221,6 +226,7 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -256,15 +262,26 @@ def load_stats(serve_dir):
     p = os.path.join(serve_dir, STATS_FILE)
     try:
         with open(p) as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("files", {})
+                data.setdefault("total_downloads", 0)
+                data.setdefault("total_bytes", 0)
+                return data
     except Exception:
-        return {"files": {}, "total_downloads": 0, "total_bytes": 0}
+        pass
+    return {"files": {}, "total_downloads": 0, "total_bytes": 0}
 
 
 def save_stats(serve_dir, stats):
     p = os.path.join(serve_dir, STATS_FILE)
-    with open(p, "w") as f:
-        json.dump(stats, f)
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(stats, f)
+        os.replace(tmp, p)
+    except OSError:
+        pass
 
 
 def record_download(serve_dir, filename, filesize):
@@ -284,7 +301,7 @@ def forget_file_stats(serve_dir, filename):
     """Drop a deleted file's counters. The running totals are history, so they stay."""
     with _stats_lock:
         stats = load_stats(serve_dir)
-        if stats["files"].pop(filename, None) is None:
+        if stats.get("files", {}).pop(filename, None) is None:
             return
         save_stats(serve_dir, stats)
 
@@ -512,8 +529,8 @@ function toast(msg, err=false) {
 async function load() {
   try {
     const [fr, sr] = await Promise.all([
-      fetch('/api/files').then(r => r.json()),
-      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/files').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
+      fetch('/api/stats').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
     ]);
     const files = fr.files || [];
     $('s-files').textContent  = files.length;
@@ -577,7 +594,8 @@ function wgetCmd(name) {
   // The URL comes from location.origin, so the command fits whatever address
   // this page was actually reached by.
   const auth = TOKEN ? ' --user=u --password=' + shellQuote(TOKEN) : '';
-  return 'wget' + auth + ' ' + location.origin + '/dl/' + encodeURIComponent(name);
+  const url = location.origin + '/dl/' + encodeURIComponent(name);
+  return 'wget' + auth + ' ' + shellQuote(url);
 }
 
 async function copyText(text) {
@@ -661,6 +679,33 @@ load();
 </script>
 </body>
 </html>"""
+
+
+# ── multipart parser ──────────────────────────────────────────────────────────
+
+def parse_multipart(body, boundary):
+    """Extract (filename, data) tuples from multipart body without MIME recursion overhead."""
+    delim = b"--" + boundary.encode()
+    parts = body.split(delim)
+    parser = BytesParser(policy=policy.default)
+    files = []
+    for p in parts:
+        if not p or p.startswith(b"--"):
+            continue
+        if p.startswith(b"\r\n"):
+            p = p[2:]
+        idx = p.find(b"\r\n\r\n")
+        if idx == -1:
+            continue
+        header_bytes = p[:idx]
+        payload = p[idx + 4:]
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        part = parser.parsebytes(header_bytes + b"\r\n\r\n")
+        filename = part.get_filename()
+        if filename is not None:
+            files.append((filename, payload))
+    return files
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -753,7 +798,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         now = time.time()
         with self._auth_lock:
             recent = [t for t in self._auth_failures.get(ip, []) if now - t < AUTH_WINDOW]
-            self._auth_failures[ip] = recent
+            if recent:
+                self._auth_failures[ip] = recent
+            else:
+                self._auth_failures.pop(ip, None)
             return len(recent)
 
     def _clear_auth_failures(self, ip):
@@ -775,9 +823,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._clear_auth_failures(ip)
             return True
         if self._auth_failures_for(ip) >= AUTH_MAX_FAILURES:
-            self.send_json({"error": "Too many failed attempts. Try again later."}, 429)
+            body = json.dumps({"error": "Too many failed attempts. Try again later."}).encode()
+            self.send_response(429)
+            self.send_header("WWW-Authenticate", 'Basic realm="fileserver"')
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
             return False
-        self._record_auth_failure(ip)
+        if "Authorization" in self.headers:
+            self._record_auth_failure(ip)
         body = json.dumps({"error": "Unauthorized"}).encode()
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="fileserver"')
@@ -795,6 +850,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_HEAD(self):
+        if not self._guard_request():
+            return
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if not (self.public_download and path.startswith("/dl/")):
+            if not self._require_auth():
+                return
+        if path == "/":
+            self._serve_html(head_only=True)
+        elif path.startswith("/dl/"):
+            self._download(urllib.parse.unquote(path[4:]), head_only=True)
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_GET(self):
         if not self._guard_request():
@@ -848,7 +917,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # stops a token containing "</script>" from ending the script block.
         return json.dumps(self.token).replace("<", "\\u003c")
 
-    def _serve_html(self):
+    def _serve_html(self, head_only=False):
         body = HTML.replace("__FS_TOKEN__", self._token_literal()).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -857,7 +926,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", len(body))
         self.end_headers()
-        self.wfile.write(body)
+        if not head_only:
+            self.wfile.write(body)
 
     def _api_files(self):
         # Same lock record_download() writes it under. Reading unlocked could
@@ -896,7 +966,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "total_bytes":     stats.get("total_bytes", 0),
         })
 
-    def _download(self, filename):
+    def _download(self, filename, head_only=False):
         filename = filename.replace("\r", "").replace("\n", "").replace('"', "")
         if (not filename or "\x00" in filename
                 or any(p.startswith(".") for p in filename.split("/"))):
@@ -915,7 +985,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        record_download(self.serve_dir, filename, filesize)
+        if not head_only:
+            record_download(self.serve_dir, filename, filesize)
         mime, _ = mimetypes.guess_type(filename)
         mime = mime or "application/octet-stream"
         # Header values are latin-1, so a non-latin-1 filename would raise here.
@@ -930,9 +1001,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          f"attachment; filename=\"{fallback or 'download'}\"; "
                          f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}")
         self.end_headers()
-        with open(filepath, "rb") as f:
-            while chunk := f.read(65536):
-                self.wfile.write(chunk)
+        if not head_only:
+            with open(filepath, "rb") as f:
+                while chunk := f.read(65536):
+                    self.wfile.write(chunk)
 
     def _delete(self, filename):
         # Reject rather than normalise: stripping a "/" or ".." would delete a
@@ -986,6 +1058,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "Empty request body"}, 400)
             return
         if length > self.max_upload:
+            self.close_connection = True
             self.send_json({"error": f"Upload too large (max {self.max_upload} bytes)"}, 413)
             return
         try:
@@ -996,20 +1069,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "Failed to read request body"}, 400)
             return
         if len(body) > self.max_upload:
+            self.close_connection = True
             self.send_json({"error": "Upload too large"}, 413)
             return
 
         saved = []
         try:
-            msg = BytesParser(policy=policy.default).parsebytes(
-                b"Content-Type: multipart/form-data; boundary=" + boundary.encode() + b"\r\n\r\n" + body
-            )
-            for part in msg.iter_parts():
-                filename = part.get_filename()
-                data = part.get_payload(decode=True)
-                if not filename or not data:
-                    continue
+            parts = parse_multipart(body, boundary)
+            for filename, data in parts:
+                filename = filename.replace("\\", "/")
                 filename = os.path.basename(filename)
+                filename = filename.replace("\r", "").replace("\n", "").replace("\x00", "")
                 if not filename or filename.startswith("."):
                     continue
                 base, ext = os.path.splitext(filename)
@@ -1092,6 +1162,10 @@ def main():
     Handler.allowed_hosts = frozenset(allowed)
     Handler.max_upload = args.max_upload
     Handler.public_download = args.public_download
+
+    if ":" in args.bind:
+        http.server.ThreadingHTTPServer.address_family = socket.AF_INET6
+
     server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
 
     print(f"Serving : {serve_dir}")
@@ -1128,7 +1202,6 @@ After=network.target
 [Service]
 Type=simple
 User=${RUN_USER}
-Group=${RUN_USER}
 # No leading '-' : the service must refuse to start without its token.
 EnvironmentFile=${INSTALL_DIR}/.fs_token
 ExecStart=/usr/bin/python3 ${INSTALL_DIR}/serve.py --port ${PORT} --dir ${SERVE_DIR} --bind ${BIND} --max-upload ${MAX_UPLOAD}m${ALLOW_HOST_ARGS}${PUBLIC_DL_ARG}
@@ -1338,9 +1411,11 @@ generate_token() {
 }
 
 write_token_file() {
-    printf 'FS_TOKEN=%s\n' "$1" > "$TOKEN_FILE"
-    chown root:root "$TOKEN_FILE"
-    chmod 600 "$TOKEN_FILE"
+    local tmp="${TOKEN_FILE}.tmp"
+    ( umask 077 && printf 'FS_TOKEN=%s\n' "$1" > "$tmp" )
+    chown root:root "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$TOKEN_FILE"
 }
 
 # Installs predating authentication have no token file *and* no mention of one
@@ -1412,13 +1487,13 @@ version without rotating the auth token, or 'install --force' to reinstall from 
     systemctl daemon-reload
     systemctl enable --now "$SERVICE_NAME"
 
-    # Record the version only once the service is actually up, so a failed
+    # Record the version only once the service is verified healthy, so a failed
     # install cannot make a later `update` believe it is already current.
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if wait_healthy; then
         printf '%s\n' "$VERSION" > "$VERSION_FILE"
         chmod 644 "$VERSION_FILE"
     else
-        red "WARNING: $SERVICE_NAME is not active; version not recorded."
+        red "WARNING: $SERVICE_NAME did not come up healthy; version not recorded."
         echo "         Check: journalctl -u $SERVICE_NAME -n 50 --no-pager"
     fi
 
@@ -1571,6 +1646,9 @@ do_update() {
     mkdir -p "$backup"
     cp -p "$INSTALL_DIR/serve.py" "$backup/serve.py"
     cp -p "$SERVICE_FILE"         "$backup/${SERVICE_NAME}.service"
+    if [[ -f $CONFIG_FILE ]]; then
+        cp -p "$CONFIG_FILE"      "$backup/.fs_config"
+    fi
     printf '%s\n' "${deployed:-unknown}" > "$backup/version"
     chmod -R go-rwx "$BACKUP_DIR"
     cyan "Backed up to $backup"
@@ -1644,6 +1722,11 @@ do_update() {
     red "✗ v$VERSION did not come up healthy. Rolling back..."
     cp -p "$backup/serve.py" "$INSTALL_DIR/serve.py"
     cp -p "$backup/${SERVICE_NAME}.service" "$SERVICE_FILE"
+    if [[ -f "$backup/.fs_config" ]]; then
+        cp -p "$backup/.fs_config" "$CONFIG_FILE"
+    else
+        rm -f "$CONFIG_FILE"
+    fi
     if [[ $token_created -eq 1 ]]; then
         # Put the pre-auth state back exactly; the restored unit has no token.
         rm -f "$TOKEN_FILE"
@@ -1729,9 +1812,9 @@ do_status() {
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
 case "$CMD" in
-    install)   do_install   ;;
-    update)    do_update    ;;
-    status)    do_status    ;;
+    install)        do_install   ;;
+    update|upgrade) do_update    ;;
+    status)         do_status    ;;
     uninstall) do_uninstall ;;
     *)         usage        ;;
 esac
